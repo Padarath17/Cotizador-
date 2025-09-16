@@ -1,0 +1,7 @@
+{
+  "name": "Generador de Cotizaciones y Facturas",
+  "description": "Una aplicación web para generar facturas, cotizaciones y notas de remisión de forma dinámica. Permite configurar precios, agregar costos de materiales, mano de obra y otros, aplicar aumentos por porcentaje o monto fijo, y exportar los documentos en varios formatos.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

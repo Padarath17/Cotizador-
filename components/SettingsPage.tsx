@@ -1,0 +1,616 @@
+import React, { useCallback, useState, ChangeEvent, useRef, useEffect } from 'react';
+import type { DocumentState, ColumnKey, ColumnDefinition, CostCategory, Company, FiscalProfile, DocumentType, SignatureData } from '../types';
+import { SignatureInput } from './SignatureInput';
+import { INITIAL_COLUMN_DEFINITIONS, INITIAL_COMPANY_STATE, DOCUMENT_TYPES } from '../constants';
+
+interface SettingsPageProps {
+  documentState: DocumentState;
+  setDocumentState: React.Dispatch<React.SetStateAction<DocumentState>>;
+  companies: Company[];
+  setCompanies: React.Dispatch<React.SetStateAction<Company[]>>;
+  activeCompanyId: string | null;
+  setActiveCompanyId: (id: string) => void;
+  setCurrentView: (view: 'editor' | 'profile' | 'settings') => void;
+  columnDefinitions: Record<string, ColumnDefinition>;
+  setColumnDefinitions: React.Dispatch<React.SetStateAction<Record<string, ColumnDefinition>>>;
+}
+
+const toBase64 = (file: File): Promise<string> => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = error => reject(error);
+});
+
+const fileContentToBase64 = (file: File): Promise<string> => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => {
+        const result = reader.result as string;
+        const data = result.split(',')[1]; // Get only the base64 part
+        resolve(data);
+    };
+    reader.onerror = error => reject(error);
+});
+
+const FormField: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
+    <div>
+        <label className="block text-sm font-medium text-slate-600 mb-1">{label}</label>
+        {children}
+    </div>
+);
+
+const TextInput: React.FC<React.InputHTMLAttributes<HTMLInputElement>> = (props) => (
+    <input
+        type="text"
+        {...props}
+        className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+    />
+);
+
+const NumberInput: React.FC<React.InputHTMLAttributes<HTMLInputElement>> = (props) => (
+    <input
+        type="number"
+        {...props}
+        className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+    />
+);
+
+const TagInput: React.FC<{ value: string[], onChange: (value: string[]) => void, disabled?: boolean }> = ({ value, onChange, disabled }) => {
+    const [inputValue, setInputValue] = useState('');
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === 'Enter' || e.key === ',') {
+            e.preventDefault();
+            const newTag = inputValue.trim();
+            if (newTag && !value.includes(newTag)) {
+                onChange([...value, newTag]);
+            }
+            setInputValue('');
+        }
+    };
+
+    const handleRemoveTag = (tagToRemove: string) => {
+        onChange(value.filter(tag => tag !== tagToRemove));
+    };
+
+    return (
+        <div>
+            <div className="flex flex-wrap gap-2 mb-2">
+                {value.map(tag => (
+                    <span key={tag} className="flex items-center gap-1 bg-blue-100 text-blue-800 text-sm font-medium px-2.5 py-0.5 rounded-full">
+                        {tag}
+                        {!disabled && (
+                           <button type="button" onClick={() => handleRemoveTag(tag)} className="text-blue-600 hover:text-blue-800">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                           </button>
+                        )}
+                    </span>
+                ))}
+            </div>
+            <TextInput
+                value={inputValue}
+                onChange={e => setInputValue(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={disabled}
+                placeholder={disabled ? '' : "Escribe una opción y presiona Enter"}
+            />
+        </div>
+    );
+};
+
+
+const COMPATIBLE_INPUT_TYPES: Record<ColumnDefinition['dataType'], ColumnDefinition['inputType'][]> = {
+  string: ['text', 'textarea', 'select'],
+  number: ['number', 'select'],
+  date: ['date'],
+  time: ['time'],
+  boolean: ['checkbox'],
+  image: ['file'],
+};
+
+
+export const SettingsPage: React.FC<SettingsPageProps> = ({ 
+    documentState, 
+    setDocumentState, 
+    companies,
+    setCompanies,
+    activeCompanyId,
+    setActiveCompanyId,
+    setCurrentView, 
+    columnDefinitions, 
+    setColumnDefinitions 
+}) => {
+    const [activeColumnKey, setActiveColumnKey] = useState<ColumnKey>(
+        Object.keys(columnDefinitions)[0] as ColumnKey
+    );
+    const [editingCompanyId, setEditingCompanyId] = useState<string | null>(activeCompanyId);
+    const [isSignatureModalOpen, setIsSignatureModalOpen] = useState(false);
+    const [isAddColModalOpen, setIsAddColModalOpen] = useState(false);
+    const [newColumnData, setNewColumnData] = useState({ label: '', dataType: 'string' });
+    
+    const editingCompany = companies.find(c => c.id === editingCompanyId);
+
+    useEffect(() => {
+        const keys = Object.keys(columnDefinitions);
+        if (!keys.includes(activeColumnKey)) {
+            setActiveColumnKey(keys[0] || '');
+        }
+    }, [columnDefinitions, activeColumnKey]);
+    
+    useEffect(() => {
+        // If the active company is deleted, select another one
+        if (!companies.some(c => c.id === editingCompanyId)) {
+            setEditingCompanyId(companies[0]?.id || null);
+        }
+    }, [companies, editingCompanyId]);
+
+    const handleColumnDefinitionChange = useCallback((key: ColumnKey, field: keyof ColumnDefinition, value: any) => {
+        setColumnDefinitions(prev => {
+            const newColumnDefinitions = { ...prev };
+            const oldDef = newColumnDefinitions[key];
+            newColumnDefinitions[key] = { ...oldDef, [field]: value };
+    
+            if (field === 'dataType') {
+                const newDataType = value as ColumnDefinition['dataType'];
+                const compatibleInputs = COMPATIBLE_INPUT_TYPES[newDataType];
+                if (!compatibleInputs.includes(oldDef.inputType)) {
+                    newColumnDefinitions[key].inputType = compatibleInputs[0];
+                }
+            }
+            
+            return newColumnDefinitions;
+        });
+    }, [setColumnDefinitions]);
+    
+    const handleAddCategory = () => {
+        const newCategoryName = `Nueva Categoría ${documentState.categories.length + 1}`;
+        const defaultVisibleColumns = Object.fromEntries(
+            Object.entries(columnDefinitions).map(([key, { default: isDefault }]) => [key, isDefault])
+        ) as Record<ColumnKey, boolean>;
+
+        const newCategory: CostCategory = {
+          id: crypto.randomUUID(),
+          name: newCategoryName,
+          subcategories: [{ id: crypto.randomUUID(), name: 'General', items: [] }],
+          showItems: true,
+          visibleColumns: defaultVisibleColumns,
+          markupApplications: 0,
+          applyVat: false,
+          markupType: 'none',
+          markupValue: 0,
+          markupDistribution: 'proportional',
+        };
+
+        setDocumentState(prev => ({
+            ...prev,
+            categories: [...prev.categories, newCategory]
+        }));
+    };
+
+    const handleRenameCategory = (index: number, newName: string) => {
+        if (!newName.trim()) return;
+        const newCategories = [...documentState.categories];
+        newCategories[index].name = newName;
+        setDocumentState(prev => ({ ...prev, categories: newCategories }));
+    };
+
+    const handleDeleteCategory = (index: number) => {
+        if (window.confirm(`¿Estás seguro de que quieres eliminar la categoría "${documentState.categories[index].name}"?`)) {
+            const newCategories = documentState.categories.filter((_, i) => i !== index);
+            setDocumentState(prev => ({ ...prev, categories: newCategories }));
+        }
+    };
+    
+    const handleCompanyChange = (field: keyof Company, value: any) => {
+        if (!editingCompanyId) return;
+        setCompanies(prev => prev.map(c => c.id === editingCompanyId ? { ...c, [field]: value } : c));
+    };
+
+    const handleFiscalProfileChange = (field: keyof FiscalProfile, value: string) => {
+        if (!editingCompanyId) return;
+        setCompanies(prev => prev.map(c => 
+            c.id === editingCompanyId 
+            ? { ...c, fiscalProfile: { ...c.fiscalProfile, [field]: value } } 
+            : c
+        ));
+    };
+
+    const handleFolioChange = useCallback((docType: DocumentType, field: 'prefix' | 'counter', value: string | number) => {
+        if (!editingCompanyId) return;
+        setCompanies(prev => prev.map(c => {
+            if (c.id === editingCompanyId) {
+                const newCompany = { ...c };
+                if (field === 'prefix') {
+                    newCompany.folioPrefixes = { ...newCompany.folioPrefixes, [docType]: String(value) };
+                } else {
+                    newCompany.folioCounters = { ...newCompany.folioCounters, [docType]: Number(value) };
+                }
+                return newCompany;
+            }
+            return c;
+        }));
+    }, [editingCompanyId, setCompanies]);
+
+
+    const handleCompanyFileChange = async (e: ChangeEvent<HTMLInputElement>, field: 'logo') => {
+        if (e.target.files && e.target.files[0]) {
+            const base64 = await toBase64(e.target.files[0]);
+            handleCompanyChange(field, base64);
+        }
+    };
+
+    const handleFiscalFileChange = async (e: ChangeEvent<HTMLInputElement>, field: 'certificateCer' | 'privateKey') => {
+        if (e.target.files && e.target.files[0]) {
+            const base64 = await fileContentToBase64(e.target.files[0]);
+            handleFiscalProfileChange(field, base64);
+        }
+    };
+
+    const handleSaveSignature = (signature: SignatureData) => {
+        handleCompanyChange('signature', signature);
+    };
+    
+    const handleAddNewCompany = () => {
+        const newCompany = { ...INITIAL_COMPANY_STATE, id: crypto.randomUUID(), name: `Nueva Empresa ${companies.length + 1}` };
+        setCompanies(prev => [...prev, newCompany]);
+        setEditingCompanyId(newCompany.id);
+    };
+
+    const handleDeleteCompany = (idToDelete: string) => {
+        if (companies.length <= 1) {
+            alert("No puedes eliminar la única empresa.");
+            return;
+        }
+        if (window.confirm(`¿Estás seguro de que quieres eliminar esta empresa?`)) {
+            setCompanies(prev => prev.filter(c => c.id !== idToDelete));
+        }
+    };
+
+    const handleAddColumn = () => {
+        if (!newColumnData.label.trim()) {
+            alert('El nombre de la columna no puede estar vacío.');
+            return;
+        }
+        const newKey = newColumnData.label.trim().toLowerCase().replace(/[^a-z0-9]/gi, '_');
+        if (columnDefinitions[newKey]) {
+            alert('Ya existe una columna con un nombre similar.');
+            return;
+        }
+        
+        const compatibleInputs = COMPATIBLE_INPUT_TYPES[newColumnData.dataType as ColumnDefinition['dataType']];
+
+        setColumnDefinitions(prev => ({
+            ...prev,
+            [newKey]: {
+                label: newColumnData.label.trim(),
+                default: false,
+                isEditable: true,
+                dataType: newColumnData.dataType as ColumnDefinition['dataType'],
+                inputType: compatibleInputs[0],
+                options: newColumnData.dataType === 'string' || newColumnData.dataType === 'number' ? [] : undefined,
+            }
+        }));
+        
+        setIsAddColModalOpen(false);
+        setNewColumnData({ label: '', dataType: 'string' });
+        setActiveColumnKey(newKey);
+    };
+
+    const handleDeleteColumn = (keyToDelete: ColumnKey) => {
+        if (Object.keys(columnDefinitions).length <= 1) {
+            alert('Debe haber al menos una columna.');
+            return;
+        }
+        if (window.confirm(`¿Estás seguro de que quieres eliminar la columna "${columnDefinitions[keyToDelete].label}"?`)) {
+            setColumnDefinitions(prev => {
+                const newDefs = { ...prev };
+                delete newDefs[keyToDelete];
+                return newDefs;
+            });
+        }
+    };
+
+    const activeColumn = columnDefinitions[activeColumnKey];
+
+    const SignaturePreview: React.FC<{signature?: SignatureData}> = ({ signature }) => {
+        if (!signature) return <p className="text-slate-500">Sin firma</p>;
+        if (signature.mode === 'type') {
+            return <span style={{ fontFamily: signature.fontFamily, fontSize: '1.5rem' }}>{signature.data}</span>
+        }
+        return <img src={signature.data} alt="Signature" className="max-w-full max-h-full object-contain" />
+    };
+
+    return (
+        <div>
+            <div className="flex justify-between items-center mb-6">
+                <h1 className="text-3xl font-bold text-slate-800">Configuración</h1>
+                <button
+                    onClick={() => setCurrentView('editor')}
+                    className="flex items-center gap-2 bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                    Volver al Editor
+                </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-8">
+                <div className="space-y-6">
+                    <div className="bg-white p-6 rounded-lg shadow-md">
+                        <h2 className="text-xl font-bold text-slate-700 mb-4">Perfiles de Empresa</h2>
+                        <div className="space-y-2">
+                           {companies.map(company => (
+                               <div key={company.id} className={`p-2 rounded-md flex justify-between items-center ${editingCompanyId === company.id ? 'bg-blue-50' : 'hover:bg-slate-50'}`}>
+                                    <button onClick={() => setEditingCompanyId(company.id)} className="flex-1 text-left font-medium text-slate-700">
+                                        {company.name}
+                                        {activeCompanyId === company.id && <span className="text-xs text-blue-600 ml-2">(Activa)</span>}
+                                    </button>
+                                    <button onClick={() => handleDeleteCompany(company.id)} className="p-1 text-slate-400 hover:text-red-600 rounded-full hover:bg-red-100" title="Eliminar empresa">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                                    </button>
+                               </div>
+                           ))}
+                        </div>
+                        <button onClick={handleAddNewCompany} className="mt-4 flex items-center gap-2 text-sm bg-slate-100 text-slate-600 font-semibold py-2 px-3 rounded-lg hover:bg-slate-200 transition-colors">
+                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                            Agregar Empresa
+                        </button>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-lg shadow-md">
+                        <h2 className="text-xl font-bold text-slate-700 mb-4">Categorías de Costos</h2>
+                        <ul className="space-y-2">
+                        {documentState.categories.map((category, index) => (
+                            <li key={category.id} className="flex items-center justify-between p-2 rounded-md hover:bg-slate-50 group">
+                                <input
+                                    type="text"
+                                    value={category.name}
+                                    onChange={e => handleRenameCategory(index, e.target.value)}
+                                    className="font-medium text-slate-700 bg-transparent border-0 focus:ring-1 focus:ring-blue-500 rounded-md p-1 w-full"
+                                />
+                                <button onClick={() => handleDeleteCategory(index)} className="text-slate-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                                </button>
+                            </li>
+                        ))}
+                        </ul>
+                        <button onClick={handleAddCategory} className="mt-4 flex items-center gap-2 text-sm bg-slate-100 text-slate-600 font-semibold py-2 px-3 rounded-lg hover:bg-slate-200 transition-colors">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                            Agregar Categoría
+                        </button>
+                    </div>
+                </div>
+
+                <div className="space-y-6">
+                    {editingCompany && (
+                        <div className="bg-white p-6 rounded-lg shadow-md">
+                            <div className="flex justify-between items-center mb-4">
+                               <h2 className="text-xl font-bold text-slate-700">Editar Perfil de Empresa</h2>
+                               {activeCompanyId !== editingCompany.id && (
+                                   <button onClick={() => setActiveCompanyId(editingCompany.id)} className="text-sm bg-blue-500 text-white font-semibold py-1 px-3 rounded-lg hover:bg-blue-600">
+                                       Marcar como activa
+                                   </button>
+                               )}
+                            </div>
+                            <div className="space-y-4">
+                                <FormField label="Nombre de la Empresa (Comercial)">
+                                    <TextInput value={editingCompany.name} onChange={e => handleCompanyChange('name', e.target.value)} />
+                                </FormField>
+                                <FormField label="Dirección (Comercial)">
+                                    <textarea value={editingCompany.address} onChange={e => handleCompanyChange('address', e.target.value)} rows={3} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" />
+                                </FormField>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                  <FormField label="Teléfono">
+                                      <TextInput value={editingCompany.phone} onChange={e => handleCompanyChange('phone', e.target.value)} />
+                                  </FormField>
+                                  <FormField label="Email">
+                                      <TextInput value={editingCompany.email} onChange={e => handleCompanyChange('email', e.target.value)} />
+                                  </FormField>
+                                </div>
+                                <FormField label="Sitio Web">
+                                    <TextInput value={editingCompany.website} onChange={e => handleCompanyChange('website', e.target.value)} />
+                                </FormField>
+                                 <div>
+                                    <label className="block text-sm font-medium text-slate-600 mb-1">Logo</label>
+                                    <div className="mt-1 flex items-center gap-4">
+                                        <div className="w-16 h-16 bg-slate-100 rounded-md flex items-center justify-center">
+                                            {editingCompany.logo && <img src={editingCompany.logo} alt="Logo" className="max-w-full max-h-full object-contain" />}
+                                        </div>
+                                        <input type="file" accept="image/*" onChange={e => handleCompanyFileChange(e, 'logo')} className="block w-full text-xs text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                                    </div>
+                                </div>
+                                 <div>
+                                    <label className="block text-sm font-medium text-slate-600 mb-1">Firma Digital</label>
+                                    <div className="mt-1 flex items-center gap-4">
+                                        <div className="w-24 h-16 bg-slate-100 rounded-md flex items-center justify-center p-1">
+                                            <SignaturePreview signature={editingCompany.signature} />
+                                        </div>
+                                        <button onClick={() => setIsSignatureModalOpen(true)} className="bg-white border border-slate-300 text-slate-700 font-semibold py-2 px-4 rounded-lg hover:bg-slate-50 transition-colors text-sm">
+                                            {editingCompany.signature ? 'Cambiar Firma' : 'Agregar Firma'}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div className="mt-6 pt-4 border-t">
+                                <h3 className="text-lg font-semibold text-slate-600 mb-3">Perfil Fiscal (para Facturación)</h3>
+                                <div className="space-y-4">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <FormField label="RFC">
+                                            <TextInput value={editingCompany.fiscalProfile?.rfc || ''} onChange={e => handleFiscalProfileChange('rfc', e.target.value)} />
+                                        </FormField>
+                                        <FormField label="Régimen Fiscal">
+                                            <TextInput value={editingCompany.fiscalProfile?.taxRegime || ''} onChange={e => handleFiscalProfileChange('taxRegime', e.target.value)} />
+                                        </FormField>
+                                    </div>
+                                    <FormField label="Razón Social (Nombre Legal)">
+                                        <TextInput value={editingCompany.fiscalProfile?.legalName || ''} onChange={e => handleFiscalProfileChange('legalName', e.target.value)} />
+                                    </FormField>
+                                    <FormField label="Domicilio Fiscal">
+                                        <textarea value={editingCompany.fiscalProfile?.fiscalAddress || ''} onChange={e => handleFiscalProfileChange('fiscalAddress', e.target.value)} rows={3} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" />
+                                    </FormField>
+                                    
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-slate-600 mb-1">Certificado (.cer)</label>
+                                            <div className="flex items-center gap-2">
+                                                <input type="file" accept=".cer" onChange={e => handleFiscalFileChange(e, 'certificateCer')} className="block w-full text-xs text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-slate-50 file:text-slate-700 hover:file:bg-slate-100"/>
+                                                {editingCompany.fiscalProfile?.certificateCer && <span className="text-green-600 text-2xl">✓</span>}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-slate-600 mb-1">Llave Privada (.key)</label>
+                                            <div className="flex items-center gap-2">
+                                                <input type="file" accept=".key" onChange={e => handleFiscalFileChange(e, 'privateKey')} className="block w-full text-xs text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-slate-50 file:text-slate-700 hover:file:bg-slate-100"/>
+                                                {editingCompany.fiscalProfile?.privateKey && <span className="text-green-600 text-2xl">✓</span>}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <FormField label="Contraseña de la Llave Privada">
+                                        <TextInput type="password" value={editingCompany.fiscalProfile?.privateKeyPassword || ''} onChange={e => handleFiscalProfileChange('privateKeyPassword', e.target.value)} />
+                                    </FormField>
+                                </div>
+                            </div>
+
+                            <div className="mt-6 pt-4 border-t">
+                                <h3 className="text-lg font-semibold text-slate-600 mb-3">Configuración de Folios</h3>
+                                <div className="space-y-3">
+                                    <div className="grid grid-cols-3 gap-x-4 pb-1 border-b">
+                                        <span className="font-semibold text-sm text-slate-500">Tipo de Documento</span>
+                                        <span className="font-semibold text-sm text-slate-500">Prefijo</span>
+                                        <span className="font-semibold text-sm text-slate-500">Siguiente Número</span>
+                                    </div>
+                                    {Object.entries(DOCUMENT_TYPES).map(([type, label]) => (
+                                        <div key={type} className="grid grid-cols-3 gap-x-4 items-center">
+                                            <span className="text-sm font-medium text-slate-700">{label}</span>
+                                            <TextInput 
+                                                value={editingCompany.folioPrefixes?.[type as DocumentType] || ''}
+                                                onChange={e => handleFolioChange(type as DocumentType, 'prefix', e.target.value)}
+                                            />
+                                            <NumberInput 
+                                                value={editingCompany.folioCounters?.[type as DocumentType] || 1}
+                                                onChange={e => handleFolioChange(type as DocumentType, 'counter', parseInt(e.target.value) || 1)}
+                                                min="1"
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
+                                <p className="text-xs text-slate-500 mt-2">"Siguiente Número" es el número que se usará para el próximo documento de ese tipo que se cree.</p>
+                            </div>
+                        </div>
+                    )}
+                    
+                    <div className="bg-white p-6 rounded-lg shadow-md">
+                        <h2 className="text-xl font-bold text-slate-700 mb-4">Columnas de Artículos</h2>
+                        <div className="flex gap-6">
+                            <div className="w-1/3 border-r pr-4">
+                                <div className="flex justify-between items-center mb-2">
+                                    <h3 className="text-sm font-semibold text-slate-600">COLUMNAS</h3>
+                                    <button onClick={() => setIsAddColModalOpen(true)} className="p-1 text-slate-400 hover:text-blue-600 rounded-full hover:bg-slate-100" title="Agregar nueva columna">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                                    </button>
+                                </div>
+                                <ul className="space-y-1">
+                                    {Object.entries(columnDefinitions).map(([key, { label }]) => (
+                                        <li key={key}>
+                                            <button 
+                                                onClick={() => setActiveColumnKey(key)}
+                                                className={`w-full text-left p-2 rounded-md text-sm font-medium ${activeColumnKey === key ? 'bg-blue-100 text-blue-700' : 'text-slate-600 hover:bg-slate-100'}`}
+                                            >
+                                                {label}
+                                            </button>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                            <div className="w-2/3">
+                                {activeColumn ? (
+                                    <div className="space-y-4">
+                                        <h3 className="text-lg font-bold text-slate-800">{activeColumn.label}</h3>
+                                        <FormField label="Nombre de la Columna">
+                                            <TextInput value={activeColumn.label} onChange={e => handleColumnDefinitionChange(activeColumnKey, 'label', e.target.value)} />
+                                        </FormField>
+                                        <FormField label="Tipo de Dato">
+                                            <select
+                                                value={activeColumn.dataType}
+                                                onChange={e => handleColumnDefinitionChange(activeColumnKey, 'dataType', e.target.value)}
+                                                className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                                            >
+                                                {Object.keys(COMPATIBLE_INPUT_TYPES).map(type => <option key={type} value={type}>{type}</option>)}
+                                            </select>
+                                        </FormField>
+                                        <FormField label="Tipo de Campo de Entrada">
+                                            <select
+                                                value={activeColumn.inputType}
+                                                onChange={e => handleColumnDefinitionChange(activeColumnKey, 'inputType', e.target.value)}
+                                                className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                                            >
+                                                {COMPATIBLE_INPUT_TYPES[activeColumn.dataType].map(type => <option key={type} value={type}>{type}</option>)}
+                                            </select>
+                                        </FormField>
+                                        {(activeColumn.inputType === 'select') && (
+                                            <FormField label="Opciones (separadas por Enter)">
+                                                <TagInput value={activeColumn.options || []} onChange={v => handleColumnDefinitionChange(activeColumnKey, 'options', v)} />
+                                            </FormField>
+                                        )}
+                                        <div className="flex items-center gap-4">
+                                            <label className="flex items-center gap-2 text-sm text-slate-600">
+                                                <input type="checkbox" checked={activeColumn.default} onChange={e => handleColumnDefinitionChange(activeColumnKey, 'default', e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                                                Visible por defecto
+                                            </label>
+                                             <label className="flex items-center gap-2 text-sm text-slate-600">
+                                                <input type="checkbox" checked={activeColumn.isEditable} onChange={e => handleColumnDefinitionChange(activeColumnKey, 'isEditable', e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                                                Es editable
+                                            </label>
+                                        </div>
+                                        <div className="pt-4 border-t">
+                                            <button
+                                                onClick={() => handleDeleteColumn(activeColumnKey)}
+                                                className="text-sm text-red-600 font-semibold hover:text-red-800 hover:underline disabled:text-slate-400 disabled:cursor-not-allowed disabled:no-underline"
+                                                disabled={Object.keys(INITIAL_COLUMN_DEFINITIONS).includes(activeColumnKey)}
+                                            >
+                                                Eliminar Columna
+                                            </button>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <p className="text-slate-500">Selecciona una columna para editar sus propiedades.</p>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <SignatureInput
+                isOpen={isSignatureModalOpen}
+                onClose={() => setIsSignatureModalOpen(false)}
+                onSave={handleSaveSignature}
+                currentSignature={editingCompany?.signature}
+            />
+            
+            {isAddColModalOpen && (
+                 <div className="fixed inset-0 bg-slate-900 bg-opacity-60 z-50 flex items-center justify-center backdrop-blur-sm">
+                    <div className="bg-white rounded-lg shadow-2xl p-6 max-w-md w-full mx-4">
+                        <h2 className="text-xl font-bold text-slate-800 mb-4">Nueva Columna</h2>
+                        <div className="space-y-4">
+                             <FormField label="Nombre de la Columna">
+                                <TextInput value={newColumnData.label} onChange={e => setNewColumnData(p => ({...p, label: e.target.value}))} placeholder="Ej: No. de Serie"/>
+                            </FormField>
+                             <FormField label="Tipo de Dato">
+                                <select value={newColumnData.dataType} onChange={e => setNewColumnData(p => ({...p, dataType: e.target.value}))} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                                    {Object.keys(COMPATIBLE_INPUT_TYPES).map(type => <option key={type} value={type}>{type}</option>)}
+                                </select>
+                            </FormField>
+                        </div>
+                        <div className="flex justify-end gap-3 mt-6 pt-4 border-t">
+                            <button onClick={() => setIsAddColModalOpen(false)} className="bg-white border border-slate-300 text-slate-700 font-semibold py-2 px-4 rounded-lg hover:bg-slate-50">Cancelar</button>
+                            <button onClick={handleAddColumn} className="bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700">Agregar Columna</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
