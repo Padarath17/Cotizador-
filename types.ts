@@ -1,10 +1,17 @@
+// FIX: Define and export all types to be used across the application.
+// This file should only contain type definitions. Constants are in constants.ts.
+
 export type DocumentType = 'Pre-cotización' | 'Cotización Formal' | 'Nota de Remisión' | 'Ticket' | 'Factura' | 'Pagaré';
-
 export type DocumentStatus = 'Pendiente' | 'Aceptada' | 'Rechazada' | 'Vigente' | 'Con Garantía' | 'Pagada';
-
 export type PreviewFormat = 'Ticket' | 'Letter' | 'HalfLetterVertical' | 'HalfLetterHorizontal';
+export type ColumnKey = 'description' | 'concept' | 'unit' | 'quantity' | 'unitPrice' | 'markup' | 'vat' | 'total' | string;
+export type ToolQuality = 'Profesional' | 'Semi-profesional' | 'Principiante';
 
-export type ColumnKey = string;
+export interface User {
+  name: string;
+  email: string;
+  avatar: string;
+}
 
 export interface ColumnDefinition {
   label: string;
@@ -17,7 +24,7 @@ export interface ColumnDefinition {
 
 export interface Item {
   id: string;
-  [key: ColumnKey]: any;
+  [key: string]: any;
 }
 
 export interface Subcategory {
@@ -39,12 +46,6 @@ export interface CostCategory {
   markupDistribution: 'proportional' | 'per-item';
 }
 
-export interface Totals {
-    subtotal: number;
-    tax: number;
-    total: number;
-}
-
 export interface Address {
   street: string;
   exteriorNumber: string;
@@ -59,32 +60,53 @@ export interface Address {
 }
 
 export interface Client {
-    id: string;
-    name: string;
-    address: Address;
-    logo: string;
-    genericLogo: 'none' | 'man' | 'woman' | 'business' | 'house';
-    profileType: 'person' | 'company';
-    prefix: string;
-    requiresInvoice: boolean;
-}
-
-export interface FiscalProfile {
-  rfc: string;
-  legalName: string;
-  taxRegime: string;
-  fiscalAddress: string;
-  certificateCer: string;
-  privateKey: string;
-  privateKeyPassword: string;
+  id: string;
+  name: string;
+  prefix: string;
+  profileType: 'person' | 'business';
+  requiresInvoice: boolean;
+  address: Address;
+  logo: string;
+  genericLogo: 'none' | 'man' | 'woman' | 'business' | 'house';
 }
 
 export interface SignatureData {
-  mode: 'draw' | 'type' | 'upload';
-  data: string; // dataURL for draw/upload, text for type
-  fontFamily?: string; // for typed signatures
-  signedBy?: string; 
-  signedAt?: string; // ISO date string
+    mode: 'draw' | 'type' | 'upload';
+    data: string;
+    fontFamily?: string;
+    signedBy?: string;
+    signedAt?: string;
+}
+
+export interface FiscalProfile {
+    rfc: string;
+    legalName: string;
+    taxRegime: string;
+    fiscalAddress: string;
+    certificateCer: string;
+    privateKey: string;
+    privateKeyPassword: string;
+}
+
+export interface LaborTemplate {
+    id: string;
+    description: string;
+    unit: string;
+    unitPrice: number;
+}
+
+export interface MaterialTemplate {
+    id: string;
+    description: string;
+    unit: string;
+    unitPrice: number;
+}
+
+export interface Tool {
+    id: string;
+    name: string;
+    quality: ToolQuality;
+    purchaseDate: string;
 }
 
 export interface Company {
@@ -97,12 +119,17 @@ export interface Company {
     email: string;
     website: string;
     fiscalProfile: FiscalProfile;
-    folioCounters: {
-        [key in DocumentType]?: number;
-    };
-    folioPrefixes: {
-        [key in DocumentType]?: string;
-    };
+    folioCounters: { [key in DocumentType]?: number };
+    folioPrefixes: { [key in DocumentType]?: string };
+    laborTemplates: LaborTemplate[];
+    materialTemplates: MaterialTemplate[];
+    tools: Tool[];
+}
+
+export interface Totals {
+  subtotal: number;
+  tax: number;
+  total: number;
 }
 
 export interface PaymentPlanConfig {
@@ -117,17 +144,6 @@ export interface PaymentPlanConfig {
   customTerms: string;
 }
 
-export interface LayoutConfig {
-  headerMode: 'all_pages' | 'first_page_different';
-  headerContent: string;
-  headerFirstPageContent: string;
-  footerMode: 'all_pages' | 'last_page_different';
-  footerContent: string;
-  footerLastPageContent: string;
-  pageNumbering: 'none' | 'arabic' | 'roman';
-  includeTOC: boolean;
-}
-
 export interface Coupon {
   enabled: boolean;
   image: string;
@@ -135,63 +151,70 @@ export interface Coupon {
   offerType: 'percentage_off' | 'fixed_amount_off' | 'buy_one_get_one' | 'free_shipping' | 'custom';
   offerValue: string;
   terms: string;
-  validityStartDate?: string;
-  validityEndDate?: string;
+  validityStartDate: string;
+  validityEndDate: string;
 }
 
 export interface InterpretedTicketData {
-  storeName: string;
-  date: string;
-  items: Array<{
-    description: string;
-    quantity: number;
-    price: number;
-  }>;
-  subtotal: number;
-  tax: number;
-  total: number;
+    storeName: string;
+    date: string;
+    items: {
+        description: string;
+        quantity: number;
+        price: number;
+    }[];
+    subtotal: number;
+    tax: number;
+    total: number;
 }
 
 export interface ThirdPartyTicket {
-  id: string;
-  title: string;
-  imageData: string; // raw base64 data
-  mimeType: string;
-  displayMode: 'interpret' | 'image';
-  interpretedData?: InterpretedTicketData;
-  isProcessing: boolean;
+    id: string;
+    title: string;
+    imageData: string;
+    mimeType: string;
+    displayMode: 'image' | 'interpret';
+    isProcessing: boolean;
+    interpretedData?: InterpretedTicketData;
+}
+
+export interface LayoutConfig {
+    headerMode: 'all_pages' | 'first_page_different';
+    headerContent: string;
+    headerFirstPageContent: string;
+    footerMode: 'all_pages' | 'last_page_different';
+    footerContent: string;
+    footerLastPageContent: string;
+    pageNumbering: 'none' | 'arabic' | 'roman';
+    includeTOC: boolean;
 }
 
 export interface DocumentState {
-    id: string;
-    title: string;
-    description?: string;
-    docType: DocumentType;
-    docNumber: string;
-    status: DocumentStatus;
-    client: Client;
-    date: string;
-    validityStartDate?: string;
-    validityEndDate?: string;
-    categories: CostCategory[];
-    showVat: boolean;
-    vatRate: number;
-    currency: string;
-    issuerName: string;
-    paymentPlan: PaymentPlanConfig;
-    includeSignature: boolean;
-    clientSignature?: SignatureData;
-    previewFormat: PreviewFormat;
-    layout: LayoutConfig;
-    coupon: Coupon;
-    thirdPartyTickets: ThirdPartyTicket[];
-    termsAndConditions?: string;
-    advancePayment?: number;
-    promissoryNoteTerms?: string;
-}
-
-export interface User {
-    name: string;
-    email: string;
-    avatar: string;
+  id: string;
+  title: string;
+  description: string;
+  docType: DocumentType;
+  docNumber: string;
+  status: DocumentStatus;
+  client: Client;
+  date: string;
+  validityStartDate: string;
+  validityEndDate: string;
+  categories: CostCategory[];
+  showVat: boolean;
+  vatRate: number;
+  currency: string;
+  issuerName: string;
+  paymentPlan: PaymentPlanConfig;
+  includeSignature: boolean;
+  requestClientSignature: boolean;
+  clientSignaturePlacement: 'default' | 'left_margin' | 'right_margin';
+  clientSignature?: SignatureData;
+  previewFormat: PreviewFormat;
+  termsAndConditions: string;
+  promissoryNoteTerms: string;
+  advancePayment: number;
+  coupon: Coupon;
+  thirdPartyTickets: ThirdPartyTicket[];
+  layout: LayoutConfig;
 }

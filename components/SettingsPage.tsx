@@ -1,7 +1,10 @@
 import React, { useCallback, useState, ChangeEvent, useRef, useEffect } from 'react';
-import type { DocumentState, ColumnKey, ColumnDefinition, CostCategory, Company, FiscalProfile, DocumentType, SignatureData } from '../types';
+import { GoogleGenAI, Type } from "@google/genai";
+import type { DocumentState, ColumnKey, ColumnDefinition, CostCategory, Company, FiscalProfile, DocumentType, SignatureData, LaborTemplate, MaterialTemplate, Tool, ToolQuality } from '../types';
 import { SignatureInput } from './SignatureInput';
-import { INITIAL_COLUMN_DEFINITIONS, INITIAL_COMPANY_STATE, DOCUMENT_TYPES } from '../constants';
+import { AiTemplateSuggestionsModal, AiSuggestionData } from './AiTemplateSuggestionsModal';
+import { INITIAL_COLUMN_DEFINITIONS, INITIAL_COMPANY_STATE, DOCUMENT_TYPES, TOOL_QUALITIES } from '../constants';
+import { DatePicker } from './DatePicker';
 
 interface SettingsPageProps {
   documentState: DocumentState;
@@ -128,6 +131,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     const [isSignatureModalOpen, setIsSignatureModalOpen] = useState(false);
     const [isAddColModalOpen, setIsAddColModalOpen] = useState(false);
     const [newColumnData, setNewColumnData] = useState({ label: '', dataType: 'string' });
+    const [activeTemplateTab, setActiveTemplateTab] = useState<'labor' | 'materials' | 'tools'>('labor');
+
+    const [aiProfession, setAiProfession] = useState('');
+    const [aiServiceLevel, setAiServiceLevel] = useState<ToolQuality>('Semi-profesional');
+    const [isGeneratingSuggestions, setIsGeneratingSuggestions] = useState(false);
+    const [isSuggestionsModalOpen, setIsSuggestionsModalOpen] = useState(false);
+    const [aiSuggestions, setAiSuggestions] = useState<AiSuggestionData | null>(null);
     
     const editingCompany = companies.find(c => c.id === editingCompanyId);
 
@@ -310,6 +320,193 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             });
         }
     };
+    
+    type TemplateType = 'laborTemplates' | 'materialTemplates' | 'tools';
+    type TemplateItem = LaborTemplate | MaterialTemplate | Tool;
+
+    const handleAddTemplate = (type: TemplateType) => {
+        if (!editingCompanyId) return;
+
+        let newItem: TemplateItem;
+        if (type === 'laborTemplates') {
+            newItem = { id: crypto.randomUUID(), description: 'Nuevo Servicio', unit: 'Servicio', unitPrice: 0 };
+        } else if (type === 'materialTemplates') {
+            newItem = { id: crypto.randomUUID(), description: 'Nuevo Material', unit: 'Pza', unitPrice: 0 };
+        } else { // tools
+            newItem = { id: crypto.randomUUID(), name: 'Nueva Herramienta', quality: 'Semi-profesional', purchaseDate: new Date().toISOString().split('T')[0] };
+        }
+
+        setCompanies(prev => prev.map(c => 
+            c.id === editingCompanyId 
+            ? { ...c, [type]: [...(c[type] || []), newItem] }
+            : c
+        ));
+    };
+    
+    // FIX: Changed `field: keyof TemplateItem` to `field: string` to accommodate different property names 
+    // from different template types (LaborTemplate, MaterialTemplate, Tool). The original type resolved to 
+    // only the common key ('id'), causing type errors.
+    const handleTemplateChange = (type: TemplateType, index: number, field: string, value: any) => {
+        if (!editingCompanyId) return;
+        setCompanies(prev => prev.map(c => {
+            if (c.id === editingCompanyId) {
+                const newItems = [...(c[type] || [])];
+                newItems[index] = { ...newItems[index], [field]: value };
+                return { ...c, [type]: newItems };
+            }
+            return c;
+        }));
+    };
+
+    const handleDeleteTemplate = (type: TemplateType, index: number) => {
+        if (!editingCompanyId) return;
+        setCompanies(prev => prev.map(c => 
+            c.id === editingCompanyId 
+            ? { ...c, [type]: (c[type] || []).filter((_: any, i: number) => i !== index) }
+            : c
+        ));
+    };
+
+    const generateTemplateSuggestions = async (profession: string, serviceLevel: ToolQuality): Promise<AiSuggestionData> => {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+      const schema = {
+          type: Type.OBJECT,
+          properties: {
+              labor: {
+                  type: Type.ARRAY,
+                  description: "Sugerencias para la plantilla de Mano de Obra.",
+                  items: {
+                      type: Type.OBJECT,
+                      properties: {
+                          description: { type: Type.STRING },
+                          unit: { type: Type.STRING },
+                          unitPrice: { type: Type.NUMBER }
+                      },
+                      required: ["description", "unit", "unitPrice"]
+                  }
+              },
+              materials: {
+                  type: Type.ARRAY,
+                  description: "Sugerencias para la plantilla de Materiales.",
+                  items: {
+                      type: Type.OBJECT,
+                      properties: {
+                          description: { type: Type.STRING },
+                          unit: { type: Type.STRING },
+                          unitPrice: { type: Type.NUMBER }
+                      },
+                      required: ["description", "unit", "unitPrice"]
+                  }
+              },
+              tools: {
+                  type: Type.ARRAY,
+                  description: "Sugerencias para la plantilla de Herramientas.",
+                  items: {
+                      type: Type.OBJECT,
+                      properties: {
+                          name: { type: Type.STRING },
+                          quality: {
+                              type: Type.STRING,
+                              enum: ['Profesional', 'Semi-profesional', 'Principiante']
+                          }
+                      },
+                      required: ["name", "quality"]
+                  }
+              }
+          },
+          required: ["labor", "materials", "tools"]
+      };
+
+      const prompt = `
+          Actúa como un asesor experto para contratistas y profesionales de oficios en México.
+          Tu tarea es generar una lista de plantillas base para un profesional, basadas en su oficio y el nivel de calidad de servicio que ofrece. La moneda a utilizar es el Peso Mexicano (MXN).
+
+          Oficio del Profesional: "${profession}"
+          Nivel de Servicio Ofrecido: "${serviceLevel}"
+
+          Descripción de los Niveles de Servicio:
+          - Profesional: Utiliza materiales de alta calidad, sigue normativas, ofrece garantías. Precios altos.
+          - Semi-profesional: Equilibrio costo-calidad, materiales estándar, prácticas eficientes. Precios moderados.
+          - Principiante: Enfocado en el menor costo, materiales económicos, procesos básicos. Precios bajos.
+
+          Instrucciones:
+          Basado en el oficio y el nivel de servicio, genera 3 listas de sugerencias en formato JSON:
+          1.  labor: Una lista de al menos 5 servicios comunes de mano de obra. Para cada servicio, proporciona 'description', 'unit' (ej: Salida, Punto, m², Hora, Servicio), y un 'unitPrice' estimado y realista para el mercado mexicano y el nivel de servicio.
+          2.  materials: Una lista de al menos 5 materiales básicos y consumibles que este profesional debería considerar. Para cada material, proporciona 'description', 'unit' (ej: Pza, Kg, Rollo, Caja), y un 'unitPrice' estimado.
+          3.  tools: Una lista de al menos 5 herramientas esenciales para el oficio. Para cada herramienta, proporciona 'name' y 'quality' (debe ser el mismo que el nivel de servicio de entrada).
+
+          La respuesta DEBE ser un objeto JSON que siga el esquema proporcionado. No incluyas nada más en la respuesta.
+      `;
+
+      try {
+          const response = await ai.models.generateContent({
+              model: "gemini-2.5-flash",
+              contents: prompt,
+              config: {
+                  responseMimeType: "application/json",
+                  responseSchema: schema,
+              },
+          });
+          const jsonText = response.text.trim();
+          const cleanedJsonText = jsonText.replace(/^```json\s*|```\s*$/g, '');
+          const parsedJson = JSON.parse(cleanedJsonText);
+          return {
+              labor: parsedJson.labor || [],
+              materials: parsedJson.materials || [],
+              tools: parsedJson.tools || [],
+          };
+      } catch (error) {
+          console.error("Error generating template suggestions:", error);
+          throw new Error("No se pudieron generar las sugerencias. Inténtalo de nuevo.");
+      }
+    };
+
+    const handleGenerateSuggestions = async () => {
+        if (!aiProfession.trim() || !editingCompany) return;
+        setIsGeneratingSuggestions(true);
+        try {
+            const suggestions = await generateTemplateSuggestions(aiProfession, aiServiceLevel);
+            setAiSuggestions(suggestions);
+            setIsSuggestionsModalOpen(true);
+        } catch (error) {
+            alert(error instanceof Error ? error.message : "Ocurrió un error desconocido.");
+        } finally {
+            setIsGeneratingSuggestions(false);
+        }
+    };
+
+    const handleConfirmSuggestions = (selected: { labor: Omit<LaborTemplate, 'id'>[], materials: Omit<MaterialTemplate, 'id'>[], tools: Omit<Tool, 'id' | 'purchaseDate'>[] }) => {
+        if (!editingCompanyId) return;
+
+        setCompanies(prev => prev.map(c => {
+            if (c.id === editingCompanyId) {
+                const newCompany = { ...c };
+
+                const existingLabor = new Set(newCompany.laborTemplates.map(t => t.description.toLowerCase()));
+                const newLabor = selected.labor
+                    .filter(l => !existingLabor.has(l.description.toLowerCase()))
+                    .map(l => ({ ...l, id: crypto.randomUUID() }));
+                newCompany.laborTemplates = [...newCompany.laborTemplates, ...newLabor];
+
+                const existingMaterials = new Set(newCompany.materialTemplates.map(t => t.description.toLowerCase()));
+                const newMaterials = selected.materials
+                    .filter(m => !existingMaterials.has(m.description.toLowerCase()))
+                    .map(m => ({ ...m, id: crypto.randomUUID() }));
+                newCompany.materialTemplates = [...newCompany.materialTemplates, ...newMaterials];
+
+                const existingTools = new Set(newCompany.tools.map(t => t.name.toLowerCase()));
+                const newTools = selected.tools
+                    .filter(t => !existingTools.has(t.name.toLowerCase()))
+                    .map(t => ({ ...t, id: crypto.randomUUID(), purchaseDate: new Date().toISOString().split('T')[0] }));
+                newCompany.tools = [...newCompany.tools, ...newTools];
+
+                return newCompany;
+            }
+            return c;
+        }));
+        setIsSuggestionsModalOpen(false);
+    };
+
 
     const activeColumn = columnDefinitions[activeColumnKey];
 
@@ -320,6 +517,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         }
         return <img src={signature.data} alt="Signature" className="max-w-full max-h-full object-contain" />
     };
+
+    const TemplateTabButton: React.FC<{ tab: 'labor' | 'materials' | 'tools', label: string }> = ({ tab, label }) => (
+        <button
+            type="button"
+            onClick={() => setActiveTemplateTab(tab)}
+            className={`px-4 py-2 text-sm font-semibold border-b-2 transition-colors ${activeTemplateTab === tab ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}
+        >
+            {label}
+        </button>
+    );
 
     return (
         <div>
@@ -378,6 +585,134 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
                             Agregar Categoría
                         </button>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-lg shadow-md">
+                         <h2 className="text-xl font-bold text-slate-700 mb-4">Plantillas de Cobro y Herramientas</h2>
+                         
+                         <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                            <h3 className="text-md font-semibold text-slate-700 flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><path d="M12 3c-1.2 0-2.4.6-3 1.7A3.6 3.6 0 0 0 8 9c0 1 .4 2.5 2 2.5S12 10 12 9s.4-2.5 2-2.5a3.6 3.6 0 0 0-1-4.3c-.6-1.1-1.8-1.7-3-1.7Z"></path><path d="m12 11 1.5 2.8L16 15l-2.2 2.2L15 20l-2.8-1.5L11 21l-1.2-2.8L7.6 16l2.2-2.2L8.5 11l2.8 1.5L12 11Z"></path></svg>
+                                Asistente IA para Plantillas
+                            </h3>
+                            <p className="text-sm text-slate-600 mt-1 mb-3">
+                                Acelera tu configuración. Indica tu oficio y la IA te dará una base de precios, materiales y herramientas.
+                            </p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                                <FormField label="Profesión u Oficio">
+                                    <TextInput value={aiProfession} onChange={e => setAiProfession(e.target.value)} placeholder="Ej: Electricista, Plomero, Albañil" />
+                                </FormField>
+                                <FormField label="Nivel de Servicio Ofrecido">
+                                    <select value={aiServiceLevel} onChange={e => setAiServiceLevel(e.target.value as ToolQuality)} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                                        {Object.entries(TOOL_QUALITIES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+                                    </select>
+                                </FormField>
+                            </div>
+                            <div className="flex justify-end mt-3">
+                                <button
+                                    type="button"
+                                    onClick={handleGenerateSuggestions}
+                                    disabled={!aiProfession.trim() || isGeneratingSuggestions || !editingCompany}
+                                    className="flex items-center justify-center gap-2 bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-slate-400 disabled:cursor-wait text-sm"
+                                >
+                                    {isGeneratingSuggestions ? 'Generando...' : 'Generar Sugerencias con IA'}
+                                </button>
+                            </div>
+                         </div>
+                         
+                         <div className="border-b border-slate-200 mb-4">
+                            <nav className="-mb-px flex space-x-4" aria-label="Template Tabs">
+                                <TemplateTabButton tab="labor" label="Mano de Obra" />
+                                <TemplateTabButton tab="materials" label="Materiales" />
+                                <TemplateTabButton tab="tools" label="Herramientas" />
+                            </nav>
+                        </div>
+
+                        {editingCompany ? (
+                            <div>
+                                {activeTemplateTab === 'labor' && (
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full text-sm">
+                                            <thead className="text-left text-slate-600 bg-slate-50">
+                                                <tr>
+                                                    <th className="p-2 font-semibold">Descripción</th>
+                                                    <th className="p-2 font-semibold">Unidad</th>
+                                                    <th className="p-2 font-semibold">Precio Unit.</th>
+                                                    <th className="p-2 w-10"></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {(editingCompany.laborTemplates || []).map((item, index) => (
+                                                    <tr key={item.id} className="border-b">
+                                                        <td className="p-1"><TextInput value={item.description} onChange={e => handleTemplateChange('laborTemplates', index, 'description', e.target.value)} /></td>
+                                                        <td className="p-1"><TextInput value={item.unit} onChange={e => handleTemplateChange('laborTemplates', index, 'unit', e.target.value)} /></td>
+                                                        <td className="p-1"><NumberInput value={item.unitPrice} onChange={e => handleTemplateChange('laborTemplates', index, 'unitPrice', parseFloat(e.target.value) || 0)} /></td>
+                                                        <td className="p-1 text-center"><button onClick={() => handleDeleteTemplate('laborTemplates', index)} className="text-slate-400 hover:text-red-600 p-1 rounded-full hover:bg-red-100">&times;</button></td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                        <button onClick={() => handleAddTemplate('laborTemplates')} className="mt-2 text-sm text-blue-600 hover:underline">+ Agregar Servicio</button>
+                                    </div>
+                                )}
+                                 {activeTemplateTab === 'materials' && (
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full text-sm">
+                                            <thead className="text-left text-slate-600 bg-slate-50">
+                                                <tr>
+                                                    <th className="p-2 font-semibold">Descripción</th>
+                                                    <th className="p-2 font-semibold">Unidad</th>
+                                                    <th className="p-2 font-semibold">Precio Unit.</th>
+                                                    <th className="p-2 w-10"></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {(editingCompany.materialTemplates || []).map((item, index) => (
+                                                    <tr key={item.id} className="border-b">
+                                                        <td className="p-1"><TextInput value={item.description} onChange={e => handleTemplateChange('materialTemplates', index, 'description', e.target.value)} /></td>
+                                                        <td className="p-1"><TextInput value={item.unit} onChange={e => handleTemplateChange('materialTemplates', index, 'unit', e.target.value)} /></td>
+                                                        <td className="p-1"><NumberInput value={item.unitPrice} onChange={e => handleTemplateChange('materialTemplates', index, 'unitPrice', parseFloat(e.target.value) || 0)} /></td>
+                                                        <td className="p-1 text-center"><button onClick={() => handleDeleteTemplate('materialTemplates', index)} className="text-slate-400 hover:text-red-600 p-1 rounded-full hover:bg-red-100">&times;</button></td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                        <button onClick={() => handleAddTemplate('materialTemplates')} className="mt-2 text-sm text-blue-600 hover:underline">+ Agregar Material</button>
+                                    </div>
+                                )}
+                                {activeTemplateTab === 'tools' && (
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full text-sm">
+                                            <thead className="text-left text-slate-600 bg-slate-50">
+                                                <tr>
+                                                    <th className="p-2 font-semibold">Nombre de Herramienta</th>
+                                                    <th className="p-2 font-semibold">Fecha de Compra</th>
+                                                    <th className="p-2 font-semibold">Calidad</th>
+                                                    <th className="p-2 w-10"></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {(editingCompany.tools || []).map((item, index) => (
+                                                    <tr key={item.id} className="border-b">
+                                                        <td className="p-1"><TextInput value={item.name} onChange={e => handleTemplateChange('tools', index, 'name', e.target.value)} /></td>
+                                                        <td className="p-1"><DatePicker value={item.purchaseDate} onChange={date => handleTemplateChange('tools', index, 'purchaseDate', date)} /></td>
+                                                        <td className="p-1">
+                                                            <select value={item.quality} onChange={e => handleTemplateChange('tools', index, 'quality', e.target.value as ToolQuality)} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                                                                {Object.entries(TOOL_QUALITIES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+                                                            </select>
+                                                        </td>
+                                                        <td className="p-1 text-center"><button onClick={() => handleDeleteTemplate('tools', index)} className="text-slate-400 hover:text-red-600 p-1 rounded-full hover:bg-red-100">&times;</button></td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                        <button onClick={() => handleAddTemplate('tools')} className="mt-2 text-sm text-blue-600 hover:underline">+ Agregar Herramienta</button>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                           <p className="text-center text-slate-500 py-6">Selecciona o crea una empresa para gestionar sus plantillas.</p>
+                        )}
                     </div>
                 </div>
 
@@ -611,6 +946,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     </div>
                 </div>
             )}
+            {aiSuggestions && <AiTemplateSuggestionsModal
+                isOpen={isSuggestionsModalOpen}
+                onClose={() => setIsSuggestionsModalOpen(false)}
+                suggestions={aiSuggestions}
+                onConfirm={handleConfirmSuggestions}
+            />}
         </div>
     );
 };

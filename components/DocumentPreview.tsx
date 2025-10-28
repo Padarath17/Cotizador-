@@ -129,7 +129,7 @@ const getStatusStampInfo = (status: DocumentState['status']) => {
 
 export const DocumentPreview: React.FC<DocumentPreviewProps> = ({ documentState, totals, company, columnDefinitions }) => {
     const {
-        title, docType, docNumber, date, validityStartDate, validityEndDate, client, categories, showVat, vatRate, currency, issuerName, paymentPlan, includeSignature, clientSignature, previewFormat, layout, coupon, thirdPartyTickets, termsAndConditions, status
+        title, docType, docNumber, date, validityStartDate, validityEndDate, client, categories, showVat, vatRate, currency, issuerName, paymentPlan, includeSignature, clientSignature, previewFormat, layout, coupon, thirdPartyTickets, termsAndConditions, status, requestClientSignature, clientSignaturePlacement
     } = documentState;
 
     const currencySymbol = useMemo(() => CURRENCIES[currency]?.symbol || '$', [currency]);
@@ -165,9 +165,73 @@ export const DocumentPreview: React.FC<DocumentPreviewProps> = ({ documentState,
         }
     }
     
+    const ClientSignatureBlock: React.FC<{ signature?: SignatureData, placement?: string }> = ({ signature, placement = 'default' }) => {
+        if (signature) {
+            return <SignatureDisplay signature={signature} />;
+        }
+    
+        const placeholderClasses = placement === 'default' 
+            ? "pt-8 mt-8 text-center" 
+            : "pt-2 text-center";
+    
+        const lineClasses = placement === 'default'
+            ? "border-t w-56 mx-auto pt-1 border-slate-400"
+            : "border-t w-40 mx-auto pt-1 border-slate-400";
+            
+        return (
+            <div className={placeholderClasses}>
+                <div className={lineClasses}>
+                    <p className="text-slate-700 font-semibold text-sm">Firma y Nombre</p>
+                </div>
+            </div>
+        );
+    };
+
+    const renderFooterContent = () => {
+        const content = layout.footerContent;
+        const hasPageNumbering = layout.pageNumbering !== 'none';
+        
+        if (hasPageNumbering) {
+            const pageStr = '1'; // Preview is always page 1
+            if (content.includes('{page}')) {
+                const fullText = content.replace('{page}', pageStr);
+                return (
+                    <div className="flex justify-end items-end pt-4 mt-4 text-slate-500 text-xs text-right">
+                         <p>{fullText}</p>
+                    </div>
+                );
+            } else {
+                return (
+                    <div className="flex justify-between items-end pt-4 mt-4 text-slate-500 text-xs">
+                         <p className="pb-1">{content}</p>
+                         <p>Página {pageStr}</p>
+                    </div>
+                );
+            }
+        } else {
+            const text = content.replace('{page}', '').trim();
+            if (!text) return null;
+            return (
+                 <div className="flex justify-start items-end pt-4 mt-4 text-slate-500 text-xs">
+                     <p className="pb-1">{text}</p>
+                 </div>
+            );
+        }
+    };
+
     return (
         <>
-            <div id="document-preview-content" className={`document-preview ${getPreviewFormatClass()} text-sm`}>
+            <div id="document-preview-content" className={`document-preview ${getPreviewFormatClass()} text-sm relative`}>
+                {requestClientSignature && clientSignaturePlacement === 'left_margin' && (
+                    <div className="absolute top-1/2 left-[-60px] w-48 transform -translate-y-1/2 -rotate-90">
+                        <ClientSignatureBlock signature={clientSignature} placement="margin" />
+                    </div>
+                )}
+                {requestClientSignature && clientSignaturePlacement === 'right_margin' && (
+                    <div className="absolute top-1/2 right-[-60px] w-48 transform -translate-y-1/2 rotate-90">
+                        <ClientSignatureBlock signature={clientSignature} placement="margin" />
+                    </div>
+                )}
                 <header className="flex justify-between items-start">
                     <div className="flex items-center gap-4">
                         {company.logo && <img src={company.logo} alt={`${company.name} logo`} className="h-16 w-auto" />}
@@ -314,6 +378,49 @@ export const DocumentPreview: React.FC<DocumentPreviewProps> = ({ documentState,
                         )
                     })}
                 </section>
+
+                <section className="mt-6">
+                    <div className="flex justify-between items-end gap-8 pt-6 border-t">
+                        <div className="flex-grow">
+                            <div className={`status-stamp stamp-${stampInfo.color}`}>
+                                <span>{stampInfo.text}</span>
+                                <span className="stamp-date">{new Date(date).toLocaleDateString()}</span>
+                            </div>
+                        </div>
+                        <div className="w-full max-w-xs text-base flex-shrink-0">
+                             <table className="w-full">
+                                <tbody>
+                                    <tr>
+                                        <td className="py-1 pr-4 font-semibold text-slate-600">Subtotal:</td>
+                                        <td className="py-1 text-right font-medium text-slate-800">{formatCurrency(totals.subtotal, currencySymbol)}</td>
+                                    </tr>
+                                    {showVat && totals.tax > 0 && (
+                                        <tr>
+                                            <td className="py-1 pr-4 font-semibold text-slate-600">IVA ({vatRate}%):</td>
+                                            <td className="py-1 text-right font-medium text-slate-800">{formatCurrency(totals.tax, currencySymbol)}</td>
+                                        </tr>
+                                    )}
+                                    <tr className="border-t-2 border-slate-800">
+                                        <td className="pt-2 pr-4 font-bold text-lg text-slate-800">Total:</td>
+                                        <td className="pt-2 text-right font-bold text-lg text-slate-800">{formatCurrency(totals.total, currencySymbol)}</td>
+                                    </tr>
+                                    {documentState.advancePayment && documentState.advancePayment > 0 && (
+                                        <>
+                                            <tr>
+                                                <td className="py-1 pr-4 font-semibold text-slate-600">Anticipo:</td>
+                                                <td className="py-1 text-right font-medium text-slate-800">-{formatCurrency(documentState.advancePayment, currencySymbol)}</td>
+                                            </tr>
+                                            <tr className="border-t-2 border-slate-400">
+                                                <td className="pt-2 pr-4 font-bold text-lg text-slate-800">Restante:</td>
+                                                <td className="pt-2 text-right font-bold text-lg text-slate-800">{formatCurrency(totals.total - documentState.advancePayment, currencySymbol)}</td>
+                                            </tr>
+                                        </>
+                                    )}
+                                </tbody>
+                             </table>
+                        </div>
+                    </div>
+                </section>
                 
                 {(termsAndConditions || coupon.enabled || paymentPlan.enabled || docType === 'Pagaré') && (
                     <section className="mt-6 pt-4 border-t">
@@ -397,47 +504,6 @@ export const DocumentPreview: React.FC<DocumentPreviewProps> = ({ documentState,
                         </div>
                     )}
                     
-                    <div className="flex justify-between items-end gap-8 pt-6 mt-6 border-t">
-                        <div className="flex-grow">
-                            <div className={`status-stamp stamp-${stampInfo.color}`}>
-                                <span>{stampInfo.text}</span>
-                                <span className="stamp-date">{new Date(date).toLocaleDateString()}</span>
-                            </div>
-                        </div>
-                        <div className="w-full max-w-xs text-base flex-shrink-0">
-                             <table className="w-full">
-                                <tbody>
-                                    <tr>
-                                        <td className="py-1 pr-4 font-semibold text-slate-600">Subtotal:</td>
-                                        <td className="py-1 text-right font-medium text-slate-800">{formatCurrency(totals.subtotal, currencySymbol)}</td>
-                                    </tr>
-                                    {showVat && totals.tax > 0 && (
-                                        <tr>
-                                            <td className="py-1 pr-4 font-semibold text-slate-600">IVA ({vatRate}%):</td>
-                                            <td className="py-1 text-right font-medium text-slate-800">{formatCurrency(totals.tax, currencySymbol)}</td>
-                                        </tr>
-                                    )}
-                                    <tr className="border-t-2 border-slate-800">
-                                        <td className="pt-2 pr-4 font-bold text-lg text-slate-800">Total:</td>
-                                        <td className="pt-2 text-right font-bold text-lg text-slate-800">{formatCurrency(totals.total, currencySymbol)}</td>
-                                    </tr>
-                                    {documentState.advancePayment && documentState.advancePayment > 0 && (
-                                        <>
-                                            <tr>
-                                                <td className="py-1 pr-4 font-semibold text-slate-600">Anticipo:</td>
-                                                <td className="py-1 text-right font-medium text-slate-800">-{formatCurrency(documentState.advancePayment, currencySymbol)}</td>
-                                            </tr>
-                                            <tr className="border-t-2 border-slate-400">
-                                                <td className="pt-2 pr-4 font-bold text-lg text-slate-800">Restante:</td>
-                                                <td className="pt-2 text-right font-bold text-lg text-slate-800">{formatCurrency(totals.total - documentState.advancePayment, currencySymbol)}</td>
-                                            </tr>
-                                        </>
-                                    )}
-                                </tbody>
-                             </table>
-                        </div>
-                    </div>
-
                     <div className="flex justify-between items-end pt-8 mt-8">
                         <div className="flex-grow">
                              {includeSignature && company.signature && (
@@ -445,20 +511,13 @@ export const DocumentPreview: React.FC<DocumentPreviewProps> = ({ documentState,
                             )}
                         </div>
                          <div className="flex-grow">
-                             {clientSignature && (
-                                 <SignatureDisplay signature={clientSignature} />
+                             {requestClientSignature && clientSignaturePlacement === 'default' && (
+                                <ClientSignatureBlock signature={clientSignature} placement="default" />
                              )}
                         </div>
                     </div>
 
-                    <div className="flex justify-between items-end pt-4 mt-4">
-                         <div className="text-slate-500 text-xs pb-1">
-                            <p>{layout.footerContent.replace('{page}', '').trim()}</p>
-                        </div>
-                        <div className="text-slate-500 text-xs">
-                            {layout.pageNumbering !== 'none' && <p>Página 1</p>}
-                        </div>
-                    </div>
+                    {renderFooterContent()}
                 </footer>
 
                 {thirdPartyTickets.length > 0 && (

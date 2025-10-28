@@ -6,6 +6,8 @@ import { formatCurrency, generateFolio } from '../utils/formatters';
 import { ImageImportModal } from './ImageImportModal';
 import { DatePicker } from './DatePicker';
 import { SignatureInput } from './SignatureInput';
+import { AiAssistantOptionsModal, AiAnalysisOptions } from './AiAssistantOptionsModal';
+import { AiBulkGeneratorModal, AiGeneratorOptions } from './AiBulkGeneratorModal';
 
 
 interface DocumentEditorProps {
@@ -39,10 +41,214 @@ const toBase64ForGemini = (file: File): Promise<{ data: string, mimeType: string
     reader.onerror = error => reject(error);
 });
 
-const AccordionSection: React.FC<{ title: string; children: React.ReactNode; isOpen: boolean; setIsOpen: (isOpen: boolean) => void; actions?: React.ReactNode; }> = ({ title, children, isOpen, setIsOpen, actions }) => (
+const processCategoryWithGemini = async (
+    prompt: string,
+    images: { data: string; mimeType: string }[],
+    categoryName: string,
+    columnDefinitions: Record<string, ColumnDefinition>,
+    options: AiAnalysisOptions,
+    company: Company
+): Promise<Omit<Item, 'id'>[]> => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+
+    const itemProperties: Record<string, { type: Type, description?: string }> = {};
+    const requiredProperties: string[] = [];
+
+    // Dynamically build properties for the schema based on existing column definitions
+    for (const key in columnDefinitions) {
+        // Exclude calculated fields from what we ask the AI to generate
+        if (key === 'total' || key === 'markup' || key === 'vat') continue;
+
+        const def = columnDefinitions[key];
+        let geminiType = Type.STRING;
+        if (def.dataType === 'number') {
+            geminiType = Type.NUMBER;
+        } else if (def.dataType === 'boolean') {
+            geminiType = Type.BOOLEAN;
+        }
+        itemProperties[key] = { type: geminiType, description: def.label };
+    }
+
+    // Ensure critical fields are present and correctly typed, and mark them as required
+    itemProperties['description'] = { type: Type.STRING, description: 'Descripción detallada del concepto o artículo.' };
+    itemProperties['quantity'] = { type: Type.NUMBER, description: 'La cantidad o número de unidades.' };
+    itemProperties['unitPrice'] = { type: Type.NUMBER, description: 'El costo estimado por unidad.' };
+    itemProperties['unit'] = { type: Type.STRING, description: 'La unidad de medida (ej: Pza, m², Kg, Hora, Jornal, Servicio).' };
+    requiredProperties.push('description', 'quantity', 'unitPrice', 'unit');
+
+    const schema = {
+        type: Type.ARRAY,
+        items: {
+            type: Type.OBJECT,
+            properties: itemProperties,
+            required: requiredProperties
+        }
+    };
+    
+    let templateDataString = '';
+    if (options.dataSource === 'template') {
+        let templateData: any[] = [];
+        if (categoryName.toLowerCase().includes('mano de obra')) {
+            templateData = company.laborTemplates;
+        } else if (categoryName.toLowerCase().includes('materiales')) {
+            templateData = company.materialTemplates;
+        }
+        if (templateData.length > 0) {
+            templateDataString = `Usa los siguientes precios de mi plantilla como referencia principal. Ajústalos si es necesario para el trabajo, pero prioriza estos valores:\n${JSON.stringify(templateData)}`;
+        } else {
+             templateDataString = 'El usuario eligió usar plantillas, pero no se encontraron. Realiza una evaluación de mercado.';
+        }
+    } else {
+        templateDataString = 'Realiza una evaluación de precios de mercado actualizada para México.';
+    }
+
+    const serviceLevelDescription: Record<string, string> = {
+        'Profesional': 'Implica usar materiales de alta calidad, seguir normativas estrictas y garantizar durabilidad. Los precios deben reflejar esto.',
+        'Semi-profesional': 'Busca un equilibrio entre costo y calidad, usando materiales estándar y prácticas eficientes pero con cierta flexibilidad. Precios moderados.',
+        'Principiante': 'El objetivo es el menor costo posible, utilizando materiales económicos y procesos básicos. Precios económicos.'
+    };
+    
+    const fullPrompt = `
+        Actúa como un asistente experto para un contratista o profesional de oficios en México.
+        Tu tarea es desglosar un trabajo en conceptos detallados para una cotización, enfocándote únicamente en la categoría especificada y siguiendo las directrices del usuario.
+        La moneda a utilizar es el Peso Mexicano (MXN). Los precios deben ser estimaciones realistas para el mercado mexicano.
+
+        **Descripción del trabajo (texto e imágenes si se proporcionan):**
+        "${prompt}"
+
+        **Categoría de Costos a Desglosar:**
+        "${categoryName}"
+        
+        **Directrices del Usuario:**
+        - **Nivel de Servicio Requerido:** "${options.serviceLevel}". Esto significa: ${serviceLevelDescription[options.serviceLevel]}
+        - **Fuente de Datos para Precios:** ${templateDataString}
+
+        Basado en la descripción del trabajo y las directrices, genera una lista de conceptos o artículos que pertenecen **exclusivamente** a la categoría de "${categoryName}".
+        - Si la categoría es 'Mano de Obra', incluye conceptos como "Instalación", "Supervisión", "Desgaste de herramienta", "Limpieza de área", etc. No incluyas materiales.
+        - Si la categoría es 'Materiales', incluye todos los materiales necesarios, desde los principales hasta los consumibles. No incluyas mano de obra.
+        - Si la categoría es 'Logística', incluye conceptos como "Flete", "Transporte de personal", "Acarreo de material", etc.
+
+        Para cada concepto, proporciona valores para 'description', 'quantity', 'unit', y 'unitPrice'. Sé lo más detallado posible.
+        La respuesta DEBE ser un arreglo JSON de objetos que siga el esquema proporcionado. No incluyas nada más en la respuesta.
+    `;
+    
+    const contentParts: ({ text: string } | { inlineData: { data: string, mimeType: string }})[] = [{ text: fullPrompt }];
+    if (images.length > 0) {
+        images.forEach(image => {
+            contentParts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
+        });
+    }
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: { parts: contentParts },
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: schema,
+            },
+        });
+
+        const jsonText = response.text.trim();
+        const cleanedJsonText = jsonText.replace(/^```json\s*|```\s*$/g, '');
+        const parsedJson = JSON.parse(cleanedJsonText);
+        
+        // Ensure it's an array
+        if (Array.isArray(parsedJson)) {
+            return parsedJson;
+        }
+        return [];
+    } catch (error) {
+        console.error("Error processing category with Gemini:", error);
+        throw new Error("No se pudieron generar los artículos. Revisa la descripción o la configuración.");
+    }
+};
+
+const processMultipleCategoriesWithGemini = async (
+    prompt: string,
+    selectedCategoryNames: string[],
+    columnDefinitions: Record<string, ColumnDefinition>,
+    options: AiGeneratorOptions,
+    company: Company
+): Promise<Record<string, Omit<Item, 'id'>[]>> => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+
+    const itemProperties: Record<string, { type: Type, description?: string }> = {};
+    const requiredProperties: string[] = [];
+
+    for (const key in columnDefinitions) {
+        if (key === 'total' || key === 'markup' || key === 'vat') continue;
+        const def = columnDefinitions[key];
+        itemProperties[key] = { type: def.dataType === 'number' ? Type.NUMBER : Type.STRING, description: def.label };
+    }
+    itemProperties['description'] = { type: Type.STRING };
+    itemProperties['quantity'] = { type: Type.NUMBER };
+    itemProperties['unitPrice'] = { type: Type.NUMBER };
+    itemProperties['unit'] = { type: Type.STRING };
+    requiredProperties.push('description', 'quantity', 'unitPrice', 'unit');
+
+    const itemSchema = { type: Type.OBJECT, properties: itemProperties, required: requiredProperties };
+
+    const rootProperties: Record<string, any> = {};
+    selectedCategoryNames.forEach(name => {
+        rootProperties[name] = {
+            type: Type.ARRAY,
+            description: `Lista de artículos para la categoría "${name}"`,
+            items: itemSchema
+        };
+    });
+
+    const schema = { type: Type.OBJECT, properties: rootProperties };
+    
+    const serviceLevelDescription: Record<string, string> = {
+        'Profesional': 'Implica usar materiales de alta calidad, seguir normativas estrictas y garantizar durabilidad. Los precios deben reflejar esto.',
+        'Semi-profesional': 'Busca un equilibrio entre costo y calidad, usando materiales estándar y prácticas eficientes pero con cierta flexibilidad. Precios moderados.',
+        'Principiante': 'El objetivo es el menor costo posible, utilizando materiales económicos y procesos básicos. Precios económicos.'
+    };
+
+    const fullPrompt = `
+        Actúa como un asistente experto para un contratista en México. Tu tarea es desglosar un trabajo en conceptos detallados para una cotización, generando partidas únicamente para las categorías especificadas. La moneda es Peso Mexicano (MXN).
+
+        **Descripción del trabajo:**
+        "${prompt}"
+
+        **Categorías a Desglosar:**
+        [${selectedCategoryNames.join(', ')}]
+
+        **Directrices del Usuario:**
+        - Nivel de Servicio: "${options.serviceLevel}". Esto significa: ${serviceLevelDescription[options.serviceLevel]}
+
+        Basado en todo esto, genera listas de conceptos para cada una de las categorías solicitadas. Si una categoría solicitada no aplica al trabajo descrito, devuelve un arreglo vacío para esa clave.
+        La respuesta DEBE ser un objeto JSON que siga el esquema proporcionado, donde cada clave es uno de los nombres de categoría solicitados.
+    `;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: fullPrompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: schema,
+            },
+        });
+
+        const jsonText = response.text.trim();
+        const cleanedJsonText = jsonText.replace(/^```json\s*|```\s*$/g, '');
+        return JSON.parse(cleanedJsonText);
+    } catch (error) {
+        console.error("Error processing multiple categories with Gemini:", error);
+        throw new Error("No se pudieron generar los artículos. Revisa la descripción o la configuración.");
+    }
+};
+
+
+const AccordionSection: React.FC<{ title: string; children: React.ReactNode; isOpen: boolean; setIsOpen: (isOpen: boolean) => void; actions?: React.ReactNode; icon?: React.ReactNode }> = ({ title, children, isOpen, setIsOpen, actions, icon }) => (
     <div className="bg-white rounded-lg shadow-md transition-shadow hover:shadow-lg mb-6">
         <div className="p-4 w-full flex justify-between items-center text-left">
-            <h3 className="text-lg font-bold text-slate-700">{title}</h3>
+            <div className="flex items-center gap-3">
+              {icon}
+              <h3 className="text-lg font-bold text-slate-700">{title}</h3>
+            </div>
             <div className="flex items-center gap-4">
                 {actions}
                 <button
@@ -357,13 +563,13 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
   const [openSections, setOpenSections] = useState({
     docInfo: true,
     clientInfo: false,
+    aiAssistant: false,
     layout: false,
     categories: true,
     terms: false,
     paymentPlan: false,
     coupon: false,
     thirdPartyTickets: false,
-    clientSignature: false,
   });
 
   const [activeCategoryId, setActiveCategoryId] = useState<string | null>(
@@ -378,6 +584,16 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
   const [isGeneratingCouponTerms, setIsGeneratingCouponTerms] = useState(false);
   const [isGeneratingPaymentPlanTerms, setIsGeneratingPaymentPlanTerms] = useState(false);
   const [isGeneratingPromissoryNoteTerms, setIsGeneratingPromissoryNoteTerms] = useState(false);
+  const [isAiOptionsModalOpen, setIsAiOptionsModalOpen] = useState(false);
+  const [isAiBulkGeneratorModalOpen, setIsAiBulkGeneratorModalOpen] = useState(false);
+
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [isBulkGenerating, setIsBulkGenerating] = useState(false);
+
+  const [aiCategoryPrompt, setAiCategoryPrompt] = useState('');
+  const [isGeneratingItems, setIsGeneratingItems] = useState(false);
+  const [aiCategoryImages, setAiCategoryImages] = useState<{ file: File, previewUrl: string, base64Data: string, mimeType: string }[]>([]);
+  const aiImageInputRef = useRef<HTMLInputElement>(null);
 
   const [isClientSearchVisible, setIsClientSearchVisible] = useState(false);
   const [clientSearchQuery, setClientSearchQuery] = useState('');
@@ -412,14 +628,14 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
   }, [documentState.date, documentState.docType, company.folioPrefixes, setDocumentState, documentState.docNumber]);
 
 
+  // When category changes, clear the prompt and any attached images
   useEffect(() => {
-    // If active category is deleted, select the first one
-    if (!documentState.categories.find(c => c.id === activeCategoryId) && documentState.categories.length > 0) {
-        setActiveCategoryId(documentState.categories[0].id);
-    } else if (documentState.categories.length === 0) {
-        setActiveCategoryId(null);
-    }
-  }, [documentState.categories, activeCategoryId]);
+    setAiCategoryPrompt('');
+    setAiCategoryImages(prevImages => {
+        prevImages.forEach(img => URL.revokeObjectURL(img.previewUrl));
+        return [];
+    });
+  }, [activeCategoryId]);
 
   // Effect to enforce VAT for "Factura"
   useEffect(() => {
@@ -614,7 +830,6 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
 
     const markupApplications = category.markupApplications + 1;
     
-    // FIX: Corrected syntax for nested reduce calls.
     const categorySubtotal = category.subcategories.reduce((acc, sub) => acc + sub.items.reduce((itemAcc, item) => itemAcc + (Number(item.quantity) * Number(item.unitPrice)), 0), 0);
     const otherCategoriesSubtotal = totals.subtotal - categorySubtotal;
     const newBase = otherCategoriesSubtotal > 0 ? otherCategoriesSubtotal : totals.subtotal;
@@ -939,6 +1154,45 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
     }
   };
   
+  const handleBulkGenerateItems = async (selectedCategories: string[], options: AiGeneratorOptions) => {
+    setIsAiBulkGeneratorModalOpen(false);
+    setIsBulkGenerating(true);
+    try {
+        const generatedData = await processMultipleCategoriesWithGemini(
+            aiPrompt,
+            selectedCategories,
+            columnDefinitions,
+            options,
+            company
+        );
+
+        setDocumentState(prev => {
+            const newCategories = JSON.parse(JSON.stringify(prev.categories));
+            
+            Object.entries(generatedData).forEach(([categoryName, items]) => {
+                const category = newCategories.find((c: CostCategory) => c.name === categoryName);
+                if (category && Array.isArray(items) && items.length > 0) {
+                    const newItemsWithIds = items.map((item: Omit<Item, 'id'>) => ({ ...item, id: crypto.randomUUID() }));
+                    
+                    if (category.subcategories.length === 0) {
+                        category.subcategories.push({ id: crypto.randomUUID(), name: 'General', items: [] });
+                    }
+                    
+                    category.subcategories[0].items.push(...newItemsWithIds);
+                }
+            });
+
+            return { ...prev, categories: newCategories };
+        });
+        
+    } catch (error) {
+        alert(error instanceof Error ? error.message : "Ocurrió un error al generar los artículos.");
+    } finally {
+        setIsBulkGenerating(false);
+    }
+  };
+
+  
   const renderItemInput = useCallback((subIndex: number, itemIndex: number, item: Item, columnKey: ColumnKey) => {
       const columnDef = columnDefinitions[columnKey];
       const value = item[columnKey];
@@ -987,6 +1241,99 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
                return <TextInput value={(value as string) || ''} onChange={e => handleItemChange(subIndex, itemIndex, columnKey, e.target.value)} className={commonClasses} />;
       }
   }, [columnDefinitions, handleItemChange]);
+    
+    const executeAiAnalysis = async (options: AiAnalysisOptions) => {
+        if ((!aiCategoryPrompt.trim() && aiCategoryImages.length === 0) || !activeCategory) return;
+        setIsGeneratingItems(true);
+        try {
+            const imagePayloads = aiCategoryImages.map(img => ({
+                data: img.base64Data,
+                mimeType: img.mimeType
+            }));
+
+            const generatedItems = await processCategoryWithGemini(
+                aiCategoryPrompt,
+                imagePayloads,
+                activeCategory.name,
+                columnDefinitions,
+                options,
+                company
+            );
+            
+            if (generatedItems && Array.isArray(generatedItems) && generatedItems.length > 0) {
+                // Add items to the first subcategory
+                setDocumentState(prev => {
+                    const newCategories = [...prev.categories];
+                    const catIndex = newCategories.findIndex(c => c.id === activeCategoryId);
+                    if (catIndex === -1) return prev; // Should not happen
+
+                    const categoryToUpdate = { ...newCategories[catIndex] };
+                    
+                    // Ensure there's at least one subcategory
+                    if (categoryToUpdate.subcategories.length === 0) {
+                         categoryToUpdate.subcategories.push({ id: crypto.randomUUID(), name: 'General', items: [] });
+                    }
+                    
+                    const subcategoriesToUpdate = [...categoryToUpdate.subcategories];
+                    const firstSubcategory = { ...subcategoriesToUpdate[0] };
+                    
+                    const newItemsWithIds = generatedItems.map(item => ({
+                        ...item,
+                        id: crypto.randomUUID(),
+                    }));
+
+                    firstSubcategory.items = [...firstSubcategory.items, ...newItemsWithIds];
+                    subcategoriesToUpdate[0] = firstSubcategory;
+                    categoryToUpdate.subcategories = subcategoriesToUpdate;
+                    newCategories[catIndex] = categoryToUpdate;
+                    
+                    return { ...prev, categories: newCategories };
+                });
+                setAiCategoryPrompt(''); // Clear prompt on success
+                setAiCategoryImages(prev => { // Clear images on success
+                    prev.forEach(img => URL.revokeObjectURL(img.previewUrl));
+                    return [];
+                });
+            } else {
+                alert("La IA no generó ningún artículo. Intenta ser más descriptivo.");
+            }
+
+        } catch (error) {
+            console.error("Error generating items with Gemini:", error);
+            alert(error instanceof Error ? error.message : "Ocurrió un error al generar los artículos. Por favor, inténtalo de nuevo.");
+        } finally {
+            setIsGeneratingItems(false);
+        }
+    };
+    
+    const handleAiImageUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+        if (e.target.files) {
+            const files = Array.from(e.target.files);
+    
+            const imagePromises = files.map(async file => {
+                const { data, mimeType } = await toBase64ForGemini(file);
+                const previewUrl = URL.createObjectURL(file);
+                return { file, previewUrl, base64Data: data, mimeType };
+            });
+    
+            const newImages = await Promise.all(imagePromises);
+            setAiCategoryImages(prev => [...prev, ...newImages]);
+        }
+        if (e.target) {
+            e.target.value = '';
+        }
+    };
+
+    const handleRemoveAiImage = (fileName: string) => {
+        setAiCategoryImages(prev => {
+            const imageToRemove = prev.find(img => img.file.name === fileName);
+            if (imageToRemove) {
+                URL.revokeObjectURL(imageToRemove.previewUrl);
+            }
+            return prev.filter(img => img.file.name !== fileName);
+        });
+    };
+
 
   const activeCategoryRawSubtotal = useMemo(() => {
     if (!activeCategory) return 0;
@@ -1237,75 +1584,162 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
                 </FormField>
             </div>
         </div>
+        <div className="mt-6 pt-4 border-t border-slate-200">
+            <h4 className="text-md font-semibold text-slate-700 mb-3">Firma del Cliente</h4>
+            <label className="flex items-center gap-2 mb-4 p-3 bg-slate-50 rounded-md">
+                <input
+                    type="checkbox"
+                    checked={documentState.requestClientSignature}
+                    onChange={e => handleStateChange('requestClientSignature', e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="font-medium text-slate-700">Solicitar Firma del Cliente en el Documento</span>
+            </label>
+
+            {documentState.requestClientSignature && (
+                <div className="pl-2 space-y-4 animate-fade-in">
+                    {documentState.clientSignature ? (
+                        <SignaturePreview 
+                            signature={documentState.clientSignature}
+                            onClear={() => handleStateChange('clientSignature', undefined)}
+                        />
+                    ) : (
+                        <div className="text-center p-4 bg-slate-100 rounded-md">
+                            <p className="text-slate-600">No se ha capturado la firma del cliente.</p>
+                        </div>
+                    )}
+                    
+                    <div className="flex items-center gap-4">
+                         <button 
+                            onClick={() => setIsClientSignatureModalOpen(true)} 
+                            className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors"
+                        >
+                            {documentState.clientSignature ? 'Editar Firma' : 'Capturar Firma Digital'}
+                        </button>
+                        <p className="text-sm text-slate-500">Si no se captura una firma digital, se mostrará un espacio para firma manual.</p>
+                    </div>
+                    
+                    <div>
+                        <label className="block text-sm font-medium text-slate-600 mb-2">Ubicación de la Firma</label>
+                        <div className="flex items-center gap-6 text-sm">
+                            <label className="flex items-center gap-2">
+                                <input type="radio" name="clientSigPlacement" value="default" checked={documentState.clientSignaturePlacement === 'default'} onChange={e => handleStateChange('clientSignaturePlacement', e.target.value as DocumentState['clientSignaturePlacement'])} className="h-4 w-4 border-slate-300 text-blue-600 focus:ring-blue-500" />
+                                Pie de página (Estándar)
+                            </label>
+                            <label className="flex items-center gap-2">
+                                <input type="radio" name="clientSigPlacement" value="left_margin" checked={documentState.clientSignaturePlacement === 'left_margin'} onChange={e => handleStateChange('clientSignaturePlacement', e.target.value as DocumentState['clientSignaturePlacement'])} className="h-4 w-4 border-slate-300 text-blue-600 focus:ring-blue-500" />
+                                Margen Izquierdo
+                            </label>
+                            <label className="flex items-center gap-2">
+                                <input type="radio" name="clientSigPlacement" value="right_margin" checked={documentState.clientSignaturePlacement === 'right_margin'} onChange={e => handleStateChange('clientSignaturePlacement', e.target.value as DocumentState['clientSignaturePlacement'])} className="h-4 w-4 border-slate-300 text-blue-600 focus:ring-blue-500" />
+                                Margen Derecho
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+         <style>{`
+            @keyframes fade-in {
+                0% { opacity: 0; transform: translateY(-10px); }
+                100% { opacity: 1; transform: translateY(0); }
+            }
+            .animate-fade-in {
+                animation: fade-in 0.3s ease-out forwards;
+            }
+        `}</style>
       </AccordionSection>
 
-      <AccordionSection title="Firma del Cliente" isOpen={openSections.clientSignature} setIsOpen={() => toggleSection('clientSignature')}>
-        {documentState.clientSignature ? (
-             <SignaturePreview 
-                signature={documentState.clientSignature}
-                onClear={() => handleStateChange('clientSignature', undefined)}
-            />
-        ) : (
-            <div className="text-center">
-                <p className="text-slate-600 mb-3">No se ha registrado ninguna firma del cliente para este documento.</p>
-                <button 
-                    onClick={() => setIsClientSignatureModalOpen(true)} 
-                    className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors"
+      <AccordionSection
+        title="Asistente IA para Cotizaciones"
+        isOpen={openSections.aiAssistant}
+        setIsOpen={() => toggleSection('aiAssistant')}
+        icon={<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><path d="M12 3c-1.2 0-2.4.6-3 1.7A3.6 3.6 0 0 0 8 9c0 1 .4 2.5 2 2.5S12 10 12 9s.4-2.5 2-2.5a3.6 3.6 0 0 0-1-4.3c-.6-1.1-1.8-1.7-3-1.7Z"/><path d="m12 11 1.5 2.8L16 15l-2.2 2.2L15 20l-2.8-1.5L11 21l-1.2-2.8L7.6 16l2.2-2.2L8.5 11l2.8 1.5L12 11Z"/></svg>}
+      >
+        <div className="space-y-4">
+            <FormField label="Describe el trabajo a cotizar">
+                <TextArea
+                    value={aiPrompt}
+                    onChange={e => setAiPrompt(e.target.value)}
+                    rows={4}
+                    placeholder="Ej: Instalación de una cocina integral de 3 metros en melamina, con cubierta de granito."
+                />
+            </FormField>
+            <div className="flex justify-end">
+                <button
+                    type="button"
+                    onClick={() => setIsAiBulkGeneratorModalOpen(true)}
+                    disabled={isBulkGenerating || !aiPrompt.trim()}
+                    className="flex items-center justify-center gap-2 bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-slate-400 disabled:cursor-wait"
                 >
-                    Solicitar Firma
+                    {isBulkGenerating ? (
+                        <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                    ) : (
+                       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3c-1.2 0-2.4.6-3 1.7A3.6 3.6 0 0 0 8 9c0 1 .4 2.5 2 2.5S12 10 12 9s.4-2.5 2-2.5a3.6 3.6 0 0 0-1-4.3c-.6-1.1-1.8-1.7-3-1.7Z"/><path d="m12 11 1.5 2.8L16 15l-2.2 2.2L15 20l-2.8-1.5L11 21l-1.2-2.8L7.6 16l2.2-2.2L8.5 11l2.8 1.5L12 11Z"/></svg>
+                    )}
+                    <span>{isBulkGenerating ? 'Generando...' : 'Generar Artículos'}</span>
                 </button>
             </div>
-        )}
+        </div>
       </AccordionSection>
 
       <AccordionSection title="Encabezado, Pie y Paginación" isOpen={openSections.layout} setIsOpen={() => toggleSection('layout')}>
         <div className="space-y-6">
-          {/* Header Settings */}
-          <div className="space-y-3 p-3 bg-slate-100 rounded-md">
-            <h4 className="text-md font-semibold text-slate-700">Encabezado</h4>
-            <div className="flex gap-4">
-              <label className="flex items-center"><input type="radio" name="headerMode" value="all_pages" checked={documentState.layout.headerMode === 'all_pages'} onChange={() => handleNestedStateChange('layout', 'headerMode', 'all_pages')} className="mr-2" /> Todas las páginas igual</label>
-              <label className="flex items-center"><input type="radio" name="headerMode" value="first_page_different" checked={documentState.layout.headerMode === 'first_page_different'} onChange={() => handleNestedStateChange('layout', 'headerMode', 'first_page_different')} className="mr-2" /> Primera página diferente</label>
-            </div>
-            {documentState.layout.headerMode === 'first_page_different' && (
-              <FormField label="Contenido del Encabezado (Primera Página)">
-                <TextArea value={documentState.layout.headerFirstPageContent} onChange={e => handleNestedStateChange('layout', 'headerFirstPageContent', e.target.value)} rows={2} placeholder="Ej: Reporte Confidencial" />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Header Settings */}
+            <div className="space-y-4 p-4 bg-slate-100 rounded-lg">
+              <h4 className="text-md font-semibold text-slate-800">Encabezado</h4>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" name="headerMode" value="all_pages" checked={documentState.layout.headerMode === 'all_pages'} onChange={() => handleNestedStateChange('layout', 'headerMode', 'all_pages')} className="h-4 w-4 text-blue-600 border-slate-300 focus:ring-blue-500" /> <span>Todas las páginas igual</span></label>
+                <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" name="headerMode" value="first_page_different" checked={documentState.layout.headerMode === 'first_page_different'} onChange={() => handleNestedStateChange('layout', 'headerMode', 'first_page_different')} className="h-4 w-4 text-blue-600 border-slate-300 focus:ring-blue-500" /> <span>Primera página diferente</span></label>
+              </div>
+              {documentState.layout.headerMode === 'first_page_different' && (
+                <FormField label="Contenido del Encabezado (Primera Página)">
+                  <TextArea value={documentState.layout.headerFirstPageContent} onChange={e => handleNestedStateChange('layout', 'headerFirstPageContent', e.target.value)} rows={2} placeholder="Ej: Reporte Confidencial" />
+                </FormField>
+              )}
+              <FormField label={`Contenido del Encabezado (${documentState.layout.headerMode === 'first_page_different' ? 'Otras Páginas' : 'Todas as Páginas'})`}>
+                <TextArea value={documentState.layout.headerContent} onChange={e => handleNestedStateChange('layout', 'headerContent', e.target.value)} rows={2} placeholder="Ej: Propuesta Técnica" />
               </FormField>
-            )}
-            <FormField label={`Contenido del Encabezado (${documentState.layout.headerMode === 'first_page_different' ? 'Otras Páginas' : 'Todas las Páginas'})`}>
-              <TextArea value={documentState.layout.headerContent} onChange={e => handleNestedStateChange('layout', 'headerContent', e.target.value)} rows={2} placeholder="Ej: Propuesta Técnica" />
-            </FormField>
-          </div>
-          {/* Footer Settings */}
-          <div className="space-y-3 p-3 bg-slate-100 rounded-md">
-            <h4 className="text-md font-semibold text-slate-700">Pie de Página</h4>
-            <div className="flex gap-4">
-              <label className="flex items-center"><input type="radio" name="footerMode" value="all_pages" checked={documentState.layout.footerMode === 'all_pages'} onChange={() => handleNestedStateChange('layout', 'footerMode', 'all_pages')} className="mr-2" /> Todas las páginas igual</label>
-              <label className="flex items-center"><input type="radio" name="footerMode" value="last_page_different" checked={documentState.layout.footerMode === 'last_page_different'} onChange={() => handleNestedStateChange('layout', 'footerMode', 'last_page_different')} className="mr-2" /> Última página diferente</label>
             </div>
-             {documentState.layout.footerMode === 'last_page_different' && (
-              <FormField label="Contenido del Pie de Página (Última Página)">
-                <TextArea value={documentState.layout.footerLastPageContent} onChange={e => handleNestedStateChange('layout', 'footerLastPageContent', e.target.value)} rows={2} placeholder="Ej: Gracias por su preferencia." />
+            {/* Footer Settings */}
+            <div className="space-y-4 p-4 bg-slate-100 rounded-lg">
+              <h4 className="text-md font-semibold text-slate-800">Pie de Página</h4>
+               <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" name="footerMode" value="all_pages" checked={documentState.layout.footerMode === 'all_pages'} onChange={() => handleNestedStateChange('layout', 'footerMode', 'all_pages')} className="h-4 w-4 text-blue-600 border-slate-300 focus:ring-blue-500" /> <span>Todas las páginas igual</span></label>
+                <label className="flex items-center gap-2 text-sm text-slate-700"><input type="radio" name="footerMode" value="last_page_different" checked={documentState.layout.footerMode === 'last_page_different'} onChange={() => handleNestedStateChange('layout', 'footerMode', 'last_page_different')} className="h-4 w-4 text-blue-600 border-slate-300 focus:ring-blue-500" /> <span>Última página diferente</span></label>
+              </div>
+               {documentState.layout.footerMode === 'last_page_different' && (
+                <FormField label="Contenido del Pie de Página (Última Página)">
+                  <TextArea value={documentState.layout.footerLastPageContent} onChange={e => handleNestedStateChange('layout', 'footerLastPageContent', e.target.value)} rows={2} placeholder="Ej: Gracias por su preferencia." />
+                </FormField>
+              )}
+              <FormField label={`Contenido del Pie de Página (${documentState.layout.footerMode === 'last_page_different' ? 'Otras Páginas' : 'Todas las Páginas'})`}>
+                <TextArea value={documentState.layout.footerContent} onChange={e => handleNestedStateChange('layout', 'footerContent', e.target.value)} rows={2} placeholder="Página {page}" />
               </FormField>
-            )}
-            <FormField label={`Contenido del Pie de Página (${documentState.layout.footerMode === 'last_page_different' ? 'Otras Páginas' : 'Todas las Páginas'})`}>
-              <TextArea value={documentState.layout.footerContent} onChange={e => handleNestedStateChange('layout', 'footerContent', e.target.value)} rows={2} placeholder="Usa {page} para el número de página." />
-            </FormField>
+            </div>
           </div>
            {/* General Layout Settings */}
-          <div className="space-y-3 p-3 bg-slate-100 rounded-md">
-            <h4 className="text-md font-semibold text-slate-700">Paginación y Contenido</h4>
-            <FormField label="Formato de Numeración de Página">
-              <select value={documentState.layout.pageNumbering} onChange={e => handleNestedStateChange('layout', 'pageNumbering', e.target.value)} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
-                <option value="none">Ninguna</option>
-                <option value="arabic">Números (1, 2, 3)</option>
-                <option value="roman">Romanos (i, ii, iii)</option>
-              </select>
-            </FormField>
-            <label className="flex items-center gap-2 pt-2">
-              <input type="checkbox" checked={documentState.layout.includeTOC} onChange={e => handleNestedStateChange('layout', 'includeTOC', e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
-              <span className="text-sm font-medium text-slate-600">Incluir Tabla de Contenido</span>
-            </label>
+          <div className="space-y-4 p-4 bg-slate-100 rounded-lg">
+            <h4 className="text-md font-semibold text-slate-800">Paginación y Contenido</h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <FormField label="Formato de Numeración de Página">
+                  <select value={documentState.layout.pageNumbering} onChange={e => handleNestedStateChange('layout', 'pageNumbering', e.target.value)} className="block w-full text-sm text-slate-900 bg-white rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    <option value="none">Ninguna</option>
+                    <option value="arabic">Números (1, 2, 3)</option>
+                    <option value="roman">Romanos (i, ii, iii)</option>
+                  </select>
+                </FormField>
+                <div className="flex items-center pt-6">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={documentState.layout.includeTOC} onChange={e => handleNestedStateChange('layout', 'includeTOC', e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                    <span className="text-sm font-medium text-slate-600">Incluir Tabla de Contenido</span>
+                  </label>
+                </div>
+            </div>
           </div>
         </div>
       </AccordionSection>
@@ -1408,6 +1842,74 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
                         </label>
                         );
                     })}
+                    </div>
+                </div>
+
+                <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                    <h4 className="text-md font-semibold text-slate-700 flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><path d="M12 3c-1.2 0-2.4.6-3 1.7A3.6 3.6 0 0 0 8 9c0 1 .4 2.5 2 2.5S12 10 12 9s.4-2.5 2-2.5a3.6 3.6 0 0 0-1-4.3c-.6-1.1-1.8-1.7-3-1.7Z"></path><path d="m12 11 1.5 2.8L16 15l-2.2 2.2L15 20l-2.8-1.5L11 21l-1.2-2.8L7.6 16l2.2-2.2L8.5 11l2.8 1.5L12 11Z"></path></svg>
+                        Asistente IA para "{activeCategory.name}"
+                    </h4>
+                    <p className="text-sm text-slate-600 mt-1 mb-3">
+                        Describe un trabajo y la IA sugerirá los artículos, cantidades y precios para esta categoría.
+                    </p>
+                    <TextArea
+                        value={aiCategoryPrompt}
+                        onChange={e => setAiCategoryPrompt(e.target.value)}
+                        rows={3}
+                        placeholder={`Ej: Construir un muro de tablaroca de 3x2 metros.`}
+                    />
+                    {aiCategoryImages.length > 0 && (
+                        <div className="mt-2 grid grid-cols-4 sm:grid-cols-6 gap-2">
+                            {aiCategoryImages.map((image, index) => (
+                                <div key={`${image.file.name}-${index}`} className="relative group">
+                                    <img src={image.previewUrl} alt={image.file.name} className="w-full h-20 object-cover rounded-md border" />
+                                    <button
+                                        onClick={() => handleRemoveAiImage(image.file.name)}
+                                        className="absolute top-1 right-1 bg-black bg-opacity-50 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition-opacity focus:opacity-100"
+                                        aria-label="Eliminar imagen"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <div className="flex justify-between items-center mt-2">
+                        <div>
+                            <input 
+                                type="file" 
+                                ref={aiImageInputRef} 
+                                onChange={handleAiImageUpload} 
+                                multiple 
+                                accept="image/*" 
+                                className="hidden" 
+                            />
+                            <button
+                                type="button"
+                                onClick={() => aiImageInputRef.current?.click()}
+                                className="flex items-center gap-2 bg-slate-100 text-slate-600 font-semibold py-2 px-3 rounded-lg hover:bg-slate-200 transition-colors text-sm"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"></path><circle cx="12" cy="13" r="3"></circle></svg>
+                                <span>Adjuntar Fotos</span>
+                            </button>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setIsAiOptionsModalOpen(true)}
+                            disabled={isGeneratingItems || (!aiCategoryPrompt.trim() && aiCategoryImages.length === 0)}
+                            className="flex items-center justify-center gap-2 bg-blue-600 text-white font-bold py-2 px-3 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-slate-400 disabled:cursor-wait text-sm"
+                        >
+                            {isGeneratingItems ? (
+                                <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                            ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3c-1.2 0-2.4.6-3 1.7A3.6 3.6 0 0 0 8 9c0 1 .4 2.5 2 2.5S12 10 12 9s.4-2.5 2-2.5a3.6 3.6 0 0 0-1-4.3c-.6-1.1-1.8-1.7-3-1.7Z"></path><path d="m12 11 1.5 2.8L16 15l-2.2 2.2L15 20l-2.8-1.5L11 21l-1.2-2.8L7.6 16l2.2-2.2L8.5 11l2.8 1.5L12 11Z"></path></svg>
+                            )}
+                            <span>{isGeneratingItems ? 'Generando...' : 'Generar Artículos'}</span>
+                        </button>
                     </div>
                 </div>
 
@@ -1853,6 +2355,23 @@ export const DocumentEditor: React.FC<DocumentEditorProps> = ({ documentState, s
         onSave={(signature) => handleStateChange('clientSignature', signature)}
         currentSignature={documentState.clientSignature}
         askForSignerName={true}
+      />
+      {activeCategory && <AiAssistantOptionsModal
+        isOpen={isAiOptionsModalOpen}
+        onClose={() => setIsAiOptionsModalOpen(false)}
+        onConfirm={(options) => {
+            executeAiAnalysis(options);
+            setIsAiOptionsModalOpen(false);
+        }}
+        company={company}
+        activeCategoryName={activeCategory.name}
+      />}
+      <AiBulkGeneratorModal
+        isOpen={isAiBulkGeneratorModalOpen}
+        onClose={() => setIsAiBulkGeneratorModalOpen(false)}
+        onConfirm={handleBulkGenerateItems}
+        company={company}
+        allCategoryNames={documentState.categories.map(c => c.name)}
       />
     </div>
   );

@@ -1,9 +1,8 @@
-
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import useLocalStorageState from './hooks/useLocalStorageState';
 import { useAuth } from './hooks/useAuth';
 
-import type { DocumentState, CostCategory, Item, Totals, ColumnKey, Company, Client, ColumnDefinition, DocumentType, Subcategory } from './types';
+import type { DocumentState, CostCategory, Item, Totals, ColumnKey, Company, Client, ColumnDefinition, DocumentType, Subcategory, SignatureData } from './types';
 import { INITIAL_CATEGORIES, INITIAL_COLUMN_DEFINITIONS, INITIAL_COMPANY_STATE, CURRENCIES } from './constants';
 import { formatCurrency, generateFolio } from './utils/formatters';
 
@@ -14,6 +13,8 @@ import { Login } from './components/Login';
 import { ProfilePage } from './components/ProfilePage';
 import { SettingsPage } from './components/SettingsPage';
 import { ExportModal } from './components/ExportModal';
+import { PanelToggleButton } from './components/PanelToggleButton';
+
 
 // html-to-image and jspdf are common for client-side PDF generation
 import { toPng } from 'html-to-image';
@@ -78,6 +79,9 @@ const createInitialDocumentState = (company: Company): DocumentState => {
             customTerms: 'El plan de pagos está sujeto a aprobación de crédito. Los pagos deben realizarse en las fechas estipuladas para evitar cargos por mora.',
         },
         includeSignature: false,
+        requestClientSignature: false,
+        clientSignaturePlacement: 'default',
+        clientSignature: undefined,
         previewFormat: 'Letter',
         termsAndConditions: '1. Los precios están sujetos a cambio sin previo aviso.\n2. La vigencia de esta cotización es de 30 días.\n3. El tiempo de entrega puede variar según la disponibilidad de materiales.',
         promissoryNoteTerms: 'Debo y pagaré incondicionalmente por este pagaré a la orden de {companyName} en {companyAddress} la cantidad de {totalAmount}.',
@@ -124,6 +128,7 @@ function App() {
   const [uploadedTicketHashes, setUploadedTicketHashes] = useLocalStorageState<string[]>('uploadedTicketHashes', []);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [_, forceUpdate] = React.useState(0);
+  const [isPanelCollapsed, setIsPanelCollapsed] = useLocalStorageState<boolean>('isPanelCollapsed', false);
 
   const currencySymbol = useMemo(() => CURRENCIES[documentState.currency]?.symbol || '$', [documentState.currency]);
 
@@ -330,22 +335,27 @@ function App() {
     const drawFooter = () => {
         const yPos = A4_HEIGHT - MARGIN - 5;
         pdf.setFontSize(8).setTextColor(100, 116, 139);
+        const content = doc.layout.footerContent;
+        const hasPageNumbering = doc.layout.pageNumbering !== 'none';
 
-        // Custom text on the left
-        const customFooterText = doc.layout.footerContent.replace('{page}', '').trim();
-        if (customFooterText) {
-            pdf.text(customFooterText, MARGIN, yPos);
-        }
-
-        // Page number on the right
-        if (doc.layout.pageNumbering !== 'none') {
+        if (hasPageNumbering) {
             let pageStr = '';
-            if (doc.layout.pageNumbering === 'roman') {
-                pageStr = romanize(page);
-            } else { // arabic
-                pageStr = page.toString();
+            if (doc.layout.pageNumbering === 'roman') pageStr = romanize(page);
+            else pageStr = page.toString();
+
+            if (content.includes('{page}')) {
+                // If the placeholder is present, the user controls the full string, aligned right.
+                const fullText = content.replace('{page}', pageStr);
+                pdf.text(fullText, A4_WIDTH - MARGIN, yPos, { align: 'right' });
+            } else {
+                // No placeholder, so text goes left, default page number goes right.
+                if (content) pdf.text(content, MARGIN, yPos);
+                pdf.text(`Página ${pageStr}`, A4_WIDTH - MARGIN, yPos, { align: 'right' });
             }
-            pdf.text(`Página ${pageStr}`, A4_WIDTH - MARGIN, yPos, { align: 'right' });
+        } else {
+            // No page numbering, just display the text on the left.
+            const text = content.replace('{page}', '').trim();
+            if (text) pdf.text(text, MARGIN, yPos);
         }
     };
 
@@ -760,7 +770,7 @@ function App() {
     // which expects a base64 string, causing a type error. The fix also adds
     // support for rendering typed signatures as text in the PDF.
     if (doc.includeSignature && company.signature) {
-        const signature = company.signature;
+        const signature: SignatureData = company.signature;
         const sigY = A4_HEIGHT - MARGIN - FOOTER_HEIGHT - 25;
         const sigHeight = 16;
         
@@ -911,11 +921,21 @@ function App() {
         setActiveCompanyId={setActiveCompanyId}
       />
       <main>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-screen-2xl mx-auto p-4 lg:p-8">
+        <PanelToggleButton
+          isCollapsed={isPanelCollapsed}
+          onToggle={() => setIsPanelCollapsed(prev => !prev)}
+        />
+        <div 
+            className="grid grid-cols-1 lg:grid max-w-screen-2xl mx-auto p-4 lg:p-8 gap-8"
+            style={{ 
+                gridTemplateColumns: isPanelCollapsed ? '0fr 1fr' : '1fr 1fr',
+                transition: 'grid-template-columns 0.5s ease-in-out'
+            }}
+        >
             {/* Left Pane for dynamic content */}
-            <div>
-                {currentView === 'editor' && (
-                    <div className="bg-slate-50 p-6 rounded-lg shadow-lg">
+            <div className="overflow-hidden">
+                <div className="bg-slate-50 p-6 rounded-lg shadow-lg">
+                    {currentView === 'editor' && (
                         <DocumentEditor
                             documentState={documentState}
                             setDocumentState={setDocumentState}
@@ -927,34 +947,34 @@ function App() {
                             setColumnDefinitions={setColumnDefinitions}
                             savedClients={savedClients}
                         />
-                    </div>
-                )}
-                {currentView === 'profile' && (
-                    <ProfilePage
-                        savedDocuments={savedDocuments}
-                        savedClients={savedClients}
-                        setSavedClients={setSavedClients}
-                        onLoadDocument={handleLoadDocument}
-                        onDeleteDocument={handleDeleteDocument}
-                        onSelectClient={handleSelectClientForNewDoc}
-                        onNewDocument={handleNewDocument}
-                        calculateTotals={calculateTotals}
-                        currencySymbol={currencySymbol}
-                    />
-                )}
-                {currentView === 'settings' && (
-                    <SettingsPage
-                        documentState={documentState}
-                        setDocumentState={setDocumentState}
-                        companies={companies}
-                        setCompanies={setCompanies}
-                        activeCompanyId={activeCompanyId}
-                        setActiveCompanyId={setActiveCompanyId}
-                        setCurrentView={setCurrentView}
-                        columnDefinitions={columnDefinitions}
-                        setColumnDefinitions={setColumnDefinitions}
-                    />
-                )}
+                    )}
+                    {currentView === 'profile' && (
+                        <ProfilePage
+                            savedDocuments={savedDocuments}
+                            savedClients={savedClients}
+                            setSavedClients={setSavedClients}
+                            onLoadDocument={handleLoadDocument}
+                            onDeleteDocument={handleDeleteDocument}
+                            onSelectClient={handleSelectClientForNewDoc}
+                            onNewDocument={handleNewDocument}
+                            calculateTotals={calculateTotals}
+                            currencySymbol={currencySymbol}
+                        />
+                    )}
+                    {currentView === 'settings' && (
+                        <SettingsPage
+                            documentState={documentState}
+                            setDocumentState={setDocumentState}
+                            companies={companies}
+                            setCompanies={setCompanies}
+                            activeCompanyId={activeCompanyId}
+                            setActiveCompanyId={setActiveCompanyId}
+                            setCurrentView={setCurrentView}
+                            columnDefinitions={columnDefinitions}
+                            setColumnDefinitions={setColumnDefinitions}
+                        />
+                    )}
+                </div>
             </div>
 
             {/* Right Pane for persistent preview */}

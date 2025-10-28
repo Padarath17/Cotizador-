@@ -4,7 +4,8 @@ interface LoginProps {
     onLogin: (provider: 'google' | 'facebook' | 'microsoft') => void;
 }
 
-const ProviderButton: React.FC<{ provider: 'google' | 'facebook' | 'microsoft'; onLogin: LoginProps['onLogin']; icon: JSX.Element; label: string; className: string; }> = ({ provider, onLogin, icon, label, className }) => (
+// FIX: Changed JSX.Element to React.ReactNode to resolve namespace error.
+const ProviderButton: React.FC<{ provider: 'google' | 'facebook' | 'microsoft'; onLogin: LoginProps['onLogin']; icon: React.ReactNode; label: string; className: string; }> = ({ provider, onLogin, icon, label, className }) => (
     <button
         type="button"
         onClick={() => onLogin(provider)}

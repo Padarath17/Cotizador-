@@ -10,7 +10,8 @@ interface ExportModalProps {
 }
 
 const ExportOptionButton: React.FC<{
-    icon: JSX.Element;
+    // FIX: Changed JSX.Element to React.ReactNode to resolve namespace error.
+    icon: React.ReactNode;
     title: string;
     description: string;
     onClick: () => void;

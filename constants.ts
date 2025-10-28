@@ -1,4 +1,5 @@
-import type { PreviewFormat, ColumnKey, ColumnDefinition, DocumentType, DocumentStatus, Company } from './types';
+// FIX: Import all types from the dedicated types.ts file.
+import type { PreviewFormat, ColumnKey, ColumnDefinition, DocumentType, DocumentStatus, Company, ToolQuality } from './types';
 
 export const INITIAL_CATEGORIES: string[] = [
   'Mano de Obra',
@@ -91,6 +92,9 @@ export const INITIAL_COMPANY_STATE: Company = {
     },
     folioCounters: initialFolioCounters,
     folioPrefixes: initialFolioPrefixes,
+    laborTemplates: [],
+    materialTemplates: [],
+    tools: [],
 };
 
 export const CLIENT_PREFIXES: string[] = [
@@ -106,3 +110,9 @@ export const CLIENT_PREFIXES: string[] = [
   'Mtro.',
   'Mtra.',
 ];
+
+export const TOOL_QUALITIES: Record<ToolQuality, string> = {
+  'Profesional': 'Profesional',
+  'Semi-profesional': 'Semi-profesional',
+  'Principiante': 'Principiante',
+};
